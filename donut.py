@@ -324,7 +324,8 @@ def get_cblocks_from_bytes(block_iter, number_of_blocks=float("inf"), use_prev_b
         else:
             yield compress_single_block(block, block_mask, use_bit_flip)
         total_blocks += 1
-        prev_block = block
+        if use_prev_block:
+            prev_block = block
 
 def compress(data, use_prev_block=True, use_bit_flip=True, allow_partial=False):
     return b''.join(get_cblocks_from_bytes(data, use_prev_block=use_prev_block, use_bit_flip=use_bit_flip, allow_partial=allow_partial))
