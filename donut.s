@@ -231,7 +231,6 @@ shorthand_plane_def_table:
     beq plane_loop_skip
       jmp plane_loop
     plane_loop_skip:
-    ldy temp_y
   end_block:
   sec  ; Add 1 to finalize the pre-increment setup
   lda temp_y
