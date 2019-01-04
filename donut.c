@@ -4,7 +4,7 @@
 #include <stdbool.h> /* bool */
 #include <stddef.h>  /* null */
 #include <stdint.h>  /* uint8_t */
-#include <string.h>  /* strcmp() */
+#include <string.h>  /* memcpy() */
 #include <getopt.h>  /* getopt_long() */
 
 const char *VERSION_TEXT = "Donut 1.4\n";
@@ -35,11 +35,12 @@ const char *HELP_TEXT =
 #define BUF_MAX_COMPRESSED_SIZE (BUF_NUMBER_OF_BLOCKS*17)
 #define BUF_SIZE (BUF_NUMBER_OF_BLOCKS*16*2)
 
-uint8_t popcount8(uint8_t x) {
+int popcount8(uint8_t x) {
+    // would be nice if I could get this to compile to 1 CPU instruction.
     x = (x & 0x55 ) + ((x >>  1) & 0x55 );
     x = (x & 0x33 ) + ((x >>  2) & 0x33 );
     x = (x & 0x0f ) + ((x >>  4) & 0x0f );
-    return x;
+    return (int)x;
 }
 
 typedef struct byte_range {
@@ -62,34 +63,140 @@ uint64_t flip_plane_bits_135(uint64_t plane) {
     return result;
 }
 
-uint64_t unpack_pb8(uint8_t **buffer_ptr, uint8_t top_value) {
-    uint64_t plane = 0;
-    uint8_t *ptr = *buffer_ptr;
+uint64_t unpack_pb8_unchecked(uint8_t **buffer_ptr, uint8_t top_value) {
+    uint64_t plane;
+    uint8_t *ptr;
     uint8_t pb8_ctrl;
+    uint8_t pb8_byte;
     int i;
+    ptr = *buffer_ptr;
     pb8_ctrl = *(ptr);
     ++ptr;
-    for (i=0;i<8;++i) {
+    plane = 0;
+    pb8_byte = top_value;
+    for (i = 0; i < 8; ++i) {
         if (pb8_ctrl & 0x80) {
-            top_value = *(ptr);
+            pb8_byte = *(ptr);
             ++ptr;
         }
         pb8_ctrl <<= 1;
         plane <<= 8;
-        plane |= top_value;
+        plane |= pb8_byte;
     }
     *buffer_ptr = ptr;
     return plane;
 }
 
-void decompress_blocks(buffer_pointers *p){
-    int i;
-    uint8_t *block_offset_end;
+bool unpack_pb8(byte_range *buffer, uint64_t *plane, uint8_t top_value) {
+    uint8_t pb8_ctrl;
+    int l;
+    l = buffer->end - buffer->begin;
+    if (l < 1) {
+        return true;
+    }
+    pb8_ctrl = *(buffer->begin);
+    if (l < popcount8(pb8_ctrl)+1){
+        return true;
+    }
+    *plane = unpack_pb8_unchecked(&(buffer->begin), top_value);
+    return false;
+}
+
+void decompress_blocks(buffer_pointers *result_p) {
+    buffer_pointers p;
+    uint64_t plane_l;
+    uint64_t plane_m;
+    int i, j;
     uint8_t block_header;
     uint8_t plane_def;
-    uint8_t pb8_byte;
-    bool is_M_plane = false;
-    uint64_t plane;
+    uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
+    p = *(result_p);
+    while (true) {
+        if (p.source.end - p.source.begin < 1) {
+            return;
+        }
+        block_header = *(p.source.begin);
+        ++(p.source.begin);
+        if (block_header >= 0xc0) {
+            if (p.source.end - p.source.begin < 64) {
+                return;
+            }
+            for (i = 0; i < 64; ++i) {
+                *(p.destination.end) = *(p.source.begin);
+                ++(p.source.begin);
+                ++(p.destination.end);
+            }
+        } else {
+            plane_def = block_header & 0x03;
+            if (plane_def == 0) {
+                if (p.source.end - p.source.begin < 1) {
+                    return;
+                }
+                plane_def = *(p.source.begin);
+                ++(p.source.begin);
+            } else {
+                plane_def = short_defs[plane_def];
+            }
+            for (j = 0; j < 4; ++j) {
+                if (block_header & 0x10) {
+                    plane_l = 0xffffffffffffffff;
+                } else {
+                    plane_l = 0x0000000000000000;
+                }
+                if (block_header & 0x20) {
+                    plane_m = 0xffffffffffffffff;
+                } else {
+                    plane_m = 0x0000000000000000;
+                }
+                if (plane_def & 0x80) {
+                    if (unpack_pb8(&(p.source), &plane_l, (uint8_t)plane_l) == true) {
+                        return;
+                    }
+                    if (block_header & 0x08) {
+                        plane_l = flip_plane_bits_135(plane_l);
+                    }
+                }
+                plane_def <<= 1;
+                if (plane_def & 0x80) {
+                    if (unpack_pb8(&(p.source), &plane_m, (uint8_t)plane_m) == true) {
+                        return;
+                    }
+                    if (block_header & 0x08) {
+                        plane_m = flip_plane_bits_135(plane_m);
+                    }
+                }
+                plane_def <<= 1;
+                if (block_header & 0x40) {
+                    plane_l ^= plane_m;
+                }
+                if (block_header & 0x80) {
+                    plane_m ^= plane_l;
+                }
+                if (p.source.begin - p.destination.end < 16) {
+                    return;
+                }
+                for (i = 0; i < 8; ++i) {
+                    *(p.destination.end) = (plane_l >> (i*8)) & 0xff;
+                    ++(p.destination.end);
+                }
+                for (i = 0; i < 8; ++i) {
+                    *(p.destination.end) = (plane_m >> (i*8)) & 0xff;
+                    ++(p.destination.end);
+                }
+            }
+        }
+        *(result_p) = p;
+    }
+}
+
+void decompress_blocks_fast(buffer_pointers *p) {
+    uint8_t *block_offset_end;
+    uint64_t plane_l;
+    uint64_t plane_m;
+    int i;
+    uint8_t block_header;
+    uint8_t plane_def;
+    uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
     while ((p->destination.end <= p->source.begin-64) && (p->source.begin <= p->source.end-73)) {
         block_offset_end = p->destination.end + 64;
         block_header = *(p->source.begin);
@@ -104,45 +211,47 @@ void decompress_blocks(buffer_pointers *p){
                 plane_def = *(p->source.begin);
                 ++p->source.begin;
             } else {
-                plane_def = (plane_def<<6) | (plane_def<<4) | (plane_def<<2) | (plane_def);
+                plane_def = short_defs[plane_def];
             }
             while (p->destination.end < block_offset_end) {
-                if (((block_header & 0x20) && is_M_plane) || ((block_header & 0x10) && !is_M_plane)) {
-                    plane = 0xffffffffffffffff;
-                    pb8_byte = 0xff;
+                if (block_header & 0x10) {
+                    plane_l = 0xffffffffffffffff;
                 } else {
-                    plane = 0x0000000000000000;
-                    pb8_byte = 0x00;
+                    plane_l = 0x0000000000000000;
+                }
+                if (block_header & 0x20) {
+                    plane_m = 0xffffffffffffffff;
+                } else {
+                    plane_m = 0x0000000000000000;
                 }
                 if (plane_def & 0x80) {
-                    plane = unpack_pb8(&(p->source.begin), pb8_byte);
+                    plane_l = unpack_pb8_unchecked(&(p->source.begin), (uint8_t)plane_l);
                     if (block_header & 0x08) {
-                        plane = flip_plane_bits_135(plane);
+                        plane_l = flip_plane_bits_135(plane_l);
                     }
                 }
                 plane_def <<= 1;
-                *(p->destination.end+0) = (plane >>  0) & 0xff;
-                *(p->destination.end+1) = (plane >>  8) & 0xff;
-                *(p->destination.end+2) = (plane >> 16) & 0xff;
-                *(p->destination.end+3) = (plane >> 24) & 0xff;
-                *(p->destination.end+4) = (plane >> 32) & 0xff;
-                *(p->destination.end+5) = (plane >> 40) & 0xff;
-                *(p->destination.end+6) = (plane >> 48) & 0xff;
-                *(p->destination.end+7) = (plane >> 56) & 0xff;
-                p->destination.end += 8;
-                /*if (is_M_plane) {
-                    if (block_header & 0x40) {
-                        for(i = 1; i <= 8; i++){
-                            *(p->destination.end-8-i) ^= *(p->destination.end-i);
-                        }
+                if (plane_def & 0x80) {
+                    plane_m = unpack_pb8_unchecked(&(p->source.begin), (uint8_t)plane_m);
+                    if (block_header & 0x08) {
+                        plane_m = flip_plane_bits_135(plane_m);
                     }
-                    if (block_header & 0x80) {
-                        for(i = 1; i <= 8; i++){
-                            *(p->destination.end-i) ^= *(p->destination.end-8-i);
-                        }
-                    }
-                }*/
-                is_M_plane = !is_M_plane;
+                }
+                plane_def <<= 1;
+                if (block_header & 0x40) {
+                    plane_l ^= plane_m;
+                }
+                if (block_header & 0x80) {
+                    plane_m ^= plane_l;
+                }
+                for (i = 0; i < 8; ++i) {
+                    *(p->destination.end) = (plane_l >> (i*8)) & 0xff;
+                    ++p->destination.end;
+                }
+                for (i = 0; i < 8; ++i) {
+                    *(p->destination.end) = (plane_m >> (i*8)) & 0xff;
+                    ++p->destination.end;
+                }
             }
         }
     }
@@ -341,9 +450,11 @@ int main (int argc, char **argv)
                 p.source.end = p.source.end + l;
                 if (decompress) {
                     decompress_blocks(&p);
+                    //decompress_blocks_fast(&p);
                 } else {
                     compress_blocks(&p, !no_bit_flip_blocks);
                 }
+
                 l = (size_t)(p.destination.end - p.destination.begin);
                 l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
                 // check for file error
@@ -354,6 +465,7 @@ int main (int argc, char **argv)
                 }
                 p.destination.begin = p_base.destination.begin;
                 p.destination.end = p_base.destination.begin + l;
+
                 l = (size_t)(p.source.end - p.source.begin);
                 if (l > 0) {
                     memcpy(p_base.source.begin, p.source.begin, l);
