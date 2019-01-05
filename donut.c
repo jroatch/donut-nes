@@ -111,7 +111,7 @@ void decompress_blocks(buffer_pointers *result_p) {
     uint8_t plane_def;
     uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
     p = *(result_p);
-    while (true) {
+    while (p.source.begin - p.destination.end >= 64) {
         if (p.source.end - p.source.begin < 1) {
             return;
         }
@@ -172,9 +172,9 @@ void decompress_blocks(buffer_pointers *result_p) {
                 if (block_header & 0x80) {
                     plane_m ^= plane_l;
                 }
-                if (p.source.begin - p.destination.end < 16) {
+                /*if (p.source.begin - p.destination.end < 16) {
                     return;
-                }
+                }*/
                 for (i = 0; i < 8; ++i) {
                     *(p.destination.end) = (plane_l >> (i*8)) & 0xff;
                     ++(p.destination.end);
@@ -303,6 +303,9 @@ int main (int argc, char **argv)
     bool quiet_flag = false;
     bool no_bit_flip_blocks = false;
 
+    int debug_total_in_bytes = 0;
+    int debug_total_out_bytes = 0;
+
     uint8_t byte_buffer[BUF_SIZE] = {0};
     buffer_pointers p = {NULL};
     buffer_pointers p_base = {NULL};
@@ -415,7 +418,7 @@ int main (int argc, char **argv)
     }
 
     if (decompress) {
-        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_MAX_COMPRESSED_SIZE;
+        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_UNCOMPRESSED_SIZE;
         p_base.source.end = byte_buffer + BUF_SIZE;
         p_base.destination.begin = byte_buffer;
         p_base.destination.end = byte_buffer + BUF_UNCOMPRESSED_SIZE;
@@ -423,7 +426,7 @@ int main (int argc, char **argv)
         p_base.source.begin = byte_buffer + BUF_SIZE - BUF_UNCOMPRESSED_SIZE;
         p_base.source.end = byte_buffer + BUF_SIZE;
         p_base.destination.begin = byte_buffer;
-        p_base.destination.end = byte_buffer + BUF_MAX_COMPRESSED_SIZE;
+        p_base.destination.end = byte_buffer + BUF_UNCOMPRESSED_SIZE;
     }
     p.source.begin = p_base.source.begin;
     p.source.end = p_base.source.begin;
@@ -440,25 +443,58 @@ int main (int argc, char **argv)
         if (input_file != NULL) {
             setvbuf(input_file, NULL, _IONBF, 0);
             while(!feof(input_file)) {
+                /*fprintf (stderr, "in:%d out:%d|\tloop:[%ld %ld %ld %ld]\t",
+                        debug_total_in_bytes,
+                        debug_total_out_bytes,
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
+
                 l = (size_t)(p_base.source.end - p.source.end);
                 l = fread(p.source.end, sizeof(uint8_t), l, input_file);
                 // check for file error
                 if (l == 0) {
                     continue;
                 }
-                //fputs("doing a compress block\n", stderr);
+                debug_total_in_bytes += l;
                 p.source.end = p.source.end + l;
+
+                //fputs("doing a compress block\n", stderr);
+                /*fprintf (stderr, "read:[%ld %ld %ld %ld]\t",
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
                 if (decompress) {
-                    decompress_blocks(&p);
                     //decompress_blocks_fast(&p);
+                    decompress_blocks(&p);
                 } else {
                     compress_blocks(&p, !no_bit_flip_blocks);
                 }
 
+                /*fprintf (stderr, "proc:[%ld %ld %ld %ld]\t",
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
+
                 l = (size_t)(p.destination.end - p.destination.begin);
                 l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
+                debug_total_out_bytes += l;
                 // check for file error
                 p.destination.begin = p.destination.begin + l;
+
+                /*fprintf (stderr, "write:[%ld %ld %ld %ld]\t",
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
+
                 l = (size_t)(p.destination.end - p.destination.begin);
                 if (l > 0) {
                     memcpy(p_base.destination.begin, p.destination.begin, l);
@@ -466,12 +502,26 @@ int main (int argc, char **argv)
                 p.destination.begin = p_base.destination.begin;
                 p.destination.end = p_base.destination.begin + l;
 
+                /*fprintf (stderr, "mv dest:[%ld %ld %ld %ld]\t",
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
+
                 l = (size_t)(p.source.end - p.source.begin);
                 if (l > 0) {
                     memcpy(p_base.source.begin, p.source.begin, l);
                 }
                 p.source.begin = p_base.source.begin;
                 p.source.end = p_base.source.begin + l;
+
+                /*fprintf (stderr, "mv src:[%ld %ld %ld %ld]\n",
+                        p.destination.begin - p_base.destination.begin,
+                        p.destination.end - p_base.destination.begin,
+                        p.source.begin - p_base.destination.begin,
+                        p.source.end - p_base.destination.begin
+                );*/
             }
             if (input_file != stdin) {
                 fclose(input_file);
