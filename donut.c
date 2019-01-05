@@ -111,7 +111,7 @@ void decompress_blocks(buffer_pointers *result_p) {
     uint8_t plane_def;
     uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
     p = *(result_p);
-    while (p.source.begin - p.destination.end >= 64) {
+    while (p.source.begin - p.destination.end >= 73) {
         if (p.source.end - p.source.begin < 1) {
             return;
         }
@@ -121,11 +121,9 @@ void decompress_blocks(buffer_pointers *result_p) {
             if (p.source.end - p.source.begin < 64) {
                 return;
             }
-            for (i = 0; i < 64; ++i) {
-                *(p.destination.end) = *(p.source.begin);
-                ++(p.source.begin);
-                ++(p.destination.end);
-            }
+            memmove(p.destination.end, p.source.begin, 64);
+            p.source.begin += 64;
+            p.destination.end += 64;
         } else {
             plane_def = block_header & 0x03;
             if (plane_def == 0) {
@@ -202,7 +200,7 @@ void decompress_blocks_fast(buffer_pointers *p) {
         block_header = *(p->source.begin);
         ++p->source.begin;
         if (block_header >= 0xc0) {
-            memcpy(p->destination.end, p->source.begin, 64);
+            memmove(p->destination.end, p->source.begin, 64);
             p->source.begin += 64;
             p->destination.end = block_offset_end;
         } else {
@@ -282,7 +280,7 @@ void compress_blocks_raw_only(buffer_pointers *p, bool use_bit_flip){
     while ((p->destination.end <= p->source.begin-65) && (p->source.begin <= p->source.end-64)) {
         *(p->destination.end) = 0xc0;
         ++p->destination.end;
-        memcpy(p->destination.end, p->source.begin, 64);
+        memmove(p->destination.end, p->source.begin, 64);
         p->source.begin += 64;
         p->destination.end += 64;
     }
@@ -418,7 +416,7 @@ int main (int argc, char **argv)
     }
 
     if (decompress) {
-        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_UNCOMPRESSED_SIZE;
+        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_MAX_COMPRESSED_SIZE;
         p_base.source.end = byte_buffer + BUF_SIZE;
         p_base.destination.begin = byte_buffer;
         p_base.destination.end = byte_buffer + BUF_UNCOMPRESSED_SIZE;
@@ -426,7 +424,7 @@ int main (int argc, char **argv)
         p_base.source.begin = byte_buffer + BUF_SIZE - BUF_UNCOMPRESSED_SIZE;
         p_base.source.end = byte_buffer + BUF_SIZE;
         p_base.destination.begin = byte_buffer;
-        p_base.destination.end = byte_buffer + BUF_UNCOMPRESSED_SIZE;
+        p_base.destination.end = byte_buffer + BUF_MAX_COMPRESSED_SIZE;
     }
     p.source.begin = p_base.source.begin;
     p.source.end = p_base.source.begin;
@@ -497,7 +495,7 @@ int main (int argc, char **argv)
 
                 l = (size_t)(p.destination.end - p.destination.begin);
                 if (l > 0) {
-                    memcpy(p_base.destination.begin, p.destination.begin, l);
+                    memmove(p_base.destination.begin, p.destination.begin, l);
                 }
                 p.destination.begin = p_base.destination.begin;
                 p.destination.end = p_base.destination.begin + l;
@@ -511,7 +509,7 @@ int main (int argc, char **argv)
 
                 l = (size_t)(p.source.end - p.source.begin);
                 if (l > 0) {
-                    memcpy(p_base.source.begin, p.source.begin, l);
+                    memmove(p_base.source.begin, p.source.begin, l);
                 }
                 p.source.begin = p_base.source.begin;
                 p.source.end = p_base.source.begin + l;
