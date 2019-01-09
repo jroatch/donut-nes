@@ -30,10 +30,14 @@ const char *HELP_TEXT =
     "  --no-bit-flip          don't encode blocks that requires rotation\n"
 ;
 
-#define BUF_NUMBER_OF_BLOCKS 512
-#define BUF_UNCOMPRESSED_SIZE (BUF_NUMBER_OF_BLOCKS*16)
-#define BUF_MAX_COMPRESSED_SIZE (BUF_NUMBER_OF_BLOCKS*17)
-#define BUF_SIZE (BUF_NUMBER_OF_BLOCKS*16*2)
+#define BUF_IO_SIZE 8192
+#define BUF_GAP_SIZE 256
+#define BUF_TOTAL_SIZE ((BUF_IO_SIZE+BUF_GAP_SIZE)*2)
+
+uint8_t byte_buffer[BUF_TOTAL_SIZE];
+
+#define INPUT_BEGIN (byte_buffer + BUF_TOTAL_SIZE - BUF_IO_SIZE)
+#define OUTPUT_BEGIN (byte_buffer)
 
 int popcount8(uint8_t x) {
     // would be nice if I could get this to compile to 1 CPU instruction.
@@ -304,9 +308,8 @@ int main (int argc, char **argv)
     int debug_total_in_bytes = 0;
     int debug_total_out_bytes = 0;
 
-    uint8_t byte_buffer[BUF_SIZE] = {0};
     buffer_pointers p = {NULL};
-    buffer_pointers p_base = {NULL};
+    /*buffer_pointers p_base = {NULL};*/
     size_t l;
 
     while (1) {
@@ -395,7 +398,7 @@ int main (int argc, char **argv)
             output_file = fopen(output_filename, "wb");
         } else {
             output_file = fopen(output_filename, "wbx");
-            if ((errno == EEXIST) && (!quiet_flag)) {
+            if ((errno == EEXIST) && (!quiet_flag) && (argv[optind][0] != '-')) {
                 fputs(output_filename, stderr);
                 fputs(" already exists; do you wish to overwrite (y/N) ? ", stderr);
                 c = fgetc(stdin);
@@ -415,23 +418,12 @@ int main (int argc, char **argv)
         }
     }
 
-    if (decompress) {
-        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_MAX_COMPRESSED_SIZE;
-        p_base.source.end = byte_buffer + BUF_SIZE;
-        p_base.destination.begin = byte_buffer;
-        p_base.destination.end = byte_buffer + BUF_UNCOMPRESSED_SIZE;
-    }else {
-        p_base.source.begin = byte_buffer + BUF_SIZE - BUF_UNCOMPRESSED_SIZE;
-        p_base.source.end = byte_buffer + BUF_SIZE;
-        p_base.destination.begin = byte_buffer;
-        p_base.destination.end = byte_buffer + BUF_MAX_COMPRESSED_SIZE;
-    }
-    p.source.begin = p_base.source.begin;
-    p.source.end = p_base.source.begin;
-    p.destination.begin = p_base.destination.begin;
-    p.destination.end = p_base.destination.begin;
+    p.source.begin = INPUT_BEGIN;
+    p.source.end = INPUT_BEGIN;
+    p.destination.begin = OUTPUT_BEGIN;
+    p.destination.end = OUTPUT_BEGIN;
     setvbuf(output_file, NULL, _IONBF, 0);
-    while (optind < argc) {
+    while ((optind < argc) && (!ferror(output_file))) {
         input_filename = argv[optind];
         if (strcmp(input_filename, "-") == 0) {
             input_file = stdin;
@@ -440,85 +432,80 @@ int main (int argc, char **argv)
         }
         if (input_file != NULL) {
             setvbuf(input_file, NULL, _IONBF, 0);
-            while(!feof(input_file)) {
-                /*fprintf (stderr, "in:%d out:%d|\tloop:[%ld %ld %ld %ld]\t",
+            while(!feof(input_file) && !ferror(input_file) && !ferror(output_file)) {
+                /*fprintf (stderr, "in:%d out:%d|\t",
                         debug_total_in_bytes,
-                        debug_total_out_bytes,
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
+                        debug_total_out_bytes
                 );*/
 
-                l = (size_t)(p_base.source.end - p.source.end);
-                l = fread(p.source.end, sizeof(uint8_t), l, input_file);
-                // check for file error
-                if (l == 0) {
-                    continue;
+                l = (size_t)(p.source.end - p.source.begin);
+                if (l <= BUF_GAP_SIZE) {
+                    if (l > 0) {
+                        memmove(INPUT_BEGIN - l, p.source.begin, l);
+                    }
+                    p.source.begin = INPUT_BEGIN - l;
+                    p.source.end = INPUT_BEGIN;
+
+                    l = fread(p.source.end, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
+                    if (ferror(input_file)) {
+                        perror(input_filename);
+                        errno = 0;
+                        break;
+                    }
+                    if (l == 0) {
+                        continue;
+                    }
+                    //fprintf(stderr, "%ld\t", l);
+                    debug_total_in_bytes += l;
+                    p.source.end = p.source.end + l;
                 }
-                debug_total_in_bytes += l;
-                p.source.end = p.source.end + l;
 
-                //fputs("doing a compress block\n", stderr);
                 /*fprintf (stderr, "read:[%ld %ld %ld %ld]\t",
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
+                        p.destination.begin - OUTPUT_BEGIN,
+                        p.destination.end - OUTPUT_BEGIN,
+                        p.source.begin - OUTPUT_BEGIN,
+                        p.source.end - OUTPUT_BEGIN
                 );*/
+
                 if (decompress) {
-                    //decompress_blocks_fast(&p);
-                    decompress_blocks(&p);
+                    decompress_blocks_fast(&p);
+                    //decompress_blocks(&p);
                 } else {
                     compress_blocks(&p, !no_bit_flip_blocks);
                 }
 
                 /*fprintf (stderr, "proc:[%ld %ld %ld %ld]\t",
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
+                        p.destination.begin - OUTPUT_BEGIN,
+                        p.destination.end - OUTPUT_BEGIN,
+                        p.source.begin - OUTPUT_BEGIN,
+                        p.source.end - OUTPUT_BEGIN
                 );*/
 
-                l = (size_t)(p.destination.end - p.destination.begin);
-                l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
-                debug_total_out_bytes += l;
-                // check for file error
-                p.destination.begin = p.destination.begin + l;
-
-                /*fprintf (stderr, "write:[%ld %ld %ld %ld]\t",
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
-                );*/
-
-                l = (size_t)(p.destination.end - p.destination.begin);
-                if (l > 0) {
-                    memmove(p_base.destination.begin, p.destination.begin, l);
+                while ((p.destination.end - p.destination.begin) >= BUF_IO_SIZE) {
+                    l = fwrite(p.destination.begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
+                    if (ferror(output_file)) {
+                        perror(output_filename);
+                        exit(EXIT_FAILURE);
+                    }
+                    //fprintf(stderr, "%ld\n", l);
+                    debug_total_out_bytes += l;
+                    // check for file error
+                    p.destination.begin = p.destination.begin + l;
                 }
-                p.destination.begin = p_base.destination.begin;
-                p.destination.end = p_base.destination.begin + l;
-
-                /*fprintf (stderr, "mv dest:[%ld %ld %ld %ld]\t",
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
-                );*/
-
-                l = (size_t)(p.source.end - p.source.begin);
-                if (l > 0) {
-                    memmove(p_base.source.begin, p.source.begin, l);
+                if (p.destination.begin > OUTPUT_BEGIN) {
+                    l = (size_t)(p.destination.end - p.destination.begin);
+                    if (l > 0) {
+                        memmove(OUTPUT_BEGIN, p.destination.begin, l);
+                    }
+                    p.destination.begin = OUTPUT_BEGIN;
+                    p.destination.end = OUTPUT_BEGIN + l;
                 }
-                p.source.begin = p_base.source.begin;
-                p.source.end = p_base.source.begin + l;
 
-                /*fprintf (stderr, "mv src:[%ld %ld %ld %ld]\n",
-                        p.destination.begin - p_base.destination.begin,
-                        p.destination.end - p_base.destination.begin,
-                        p.source.begin - p_base.destination.begin,
-                        p.source.end - p_base.destination.begin
+                /*fprintf (stderr, "write:[%ld %ld %ld %ld]\n",
+                        p.destination.begin - OUTPUT_BEGIN,
+                        p.destination.end - OUTPUT_BEGIN,
+                        p.source.begin - OUTPUT_BEGIN,
+                        p.source.end - OUTPUT_BEGIN
                 );*/
             }
             if (input_file != stdin) {
@@ -531,6 +518,24 @@ int main (int argc, char **argv)
         }
         ++optind;
     }
+    if (p.source.end - p.source.begin > 0) {
+        if (decompress) {
+            decompress_blocks(&p);
+        } else {
+            compress_blocks(&p, !no_bit_flip_blocks);
+        }
+        l = (size_t)(p.destination.end - p.destination.begin);
+        l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
+        debug_total_out_bytes += l;
+        /*p.destination.begin = p.destination.begin + l;
+        l = (size_t)(p.destination.end - p.destination.begin);
+        if (l > 0) {
+            memmove(p_base.destination.begin, p.destination.begin, l);
+        }
+        p.destination.begin = p_base.destination.begin;
+        p.destination.end = p_base.destination.begin + l;*/
+    }
+
     if (output_file != stdout) {
         fclose(output_file);
     }
