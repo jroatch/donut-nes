@@ -307,6 +307,8 @@ int main (int argc, char **argv)
 
     int debug_total_in_bytes = 0;
     int debug_total_out_bytes = 0;
+    int i;
+    int number_of_stdin_args = 0;
 
     buffer_pointers p = {NULL};
     /*buffer_pointers p_base = {NULL};*/
@@ -394,6 +396,7 @@ int main (int argc, char **argv)
     if (strcmp(output_filename, "-") == 0) {
         output_file = stdout;
     } else {
+        fclose(stdout);
         if (force_overwrite == true) {
             output_file = fopen(output_filename, "wb");
         } else {
@@ -423,9 +426,17 @@ int main (int argc, char **argv)
     p.destination.begin = OUTPUT_BEGIN;
     p.destination.end = OUTPUT_BEGIN;
     setvbuf(output_file, NULL, _IONBF, 0);
+    for (i = optind; i < argc; ++i){
+        if (strcmp(argv[i], "-") == 0) {
+            ++number_of_stdin_args;
+        }
+    }
+    if (number_of_stdin_args == 0) {
+        fclose(stdin);
+    }
     while ((optind < argc) && (!ferror(output_file))) {
         input_filename = argv[optind];
-        if (strcmp(input_filename, "-") == 0) {
+        if ((number_of_stdin_args > 0) && (strcmp(input_filename, "-") == 0)) {
             input_file = stdin;
         } else {
             input_file = fopen(input_filename, "rb");
@@ -508,7 +519,14 @@ int main (int argc, char **argv)
                         p.source.end - OUTPUT_BEGIN
                 );*/
             }
-            if (input_file != stdin) {
+            if (input_file == stdin) {
+                --number_of_stdin_args;
+                if (number_of_stdin_args <= 0) {
+                    fclose(input_file);
+                } else {
+                    clearerr(input_file);
+                }
+            } else {
                 fclose(input_file);
             }
         } else {
@@ -536,7 +554,7 @@ int main (int argc, char **argv)
         p.destination.end = p_base.destination.begin + l;*/
     }
 
-    if (output_file != stdout) {
+    if (output_file != NULL) {
         fclose(output_file);
     }
 
