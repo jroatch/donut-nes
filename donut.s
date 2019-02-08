@@ -7,6 +7,9 @@
 ; code copies.  This file is offered as-is, without any warranty.
 ;
 ; Version History:
+; 2019-02-07: Removed "Duplicate" block type, and moved
+;             Uncompressed block to below 0xc0 to make room
+;             for block handling commands in the 0xc0~0xff space
 ; 2018-09-29: Removed block option of XORing with existing block
 ;             for extra speed in decoding.
 ; 2018-08-13: Changed the format of raw blocks to not be reversed.
@@ -31,22 +34,24 @@ donut_block_count:      .res 1
 .segment "CODE"
 
 ; Block header:
-; MLIiRCpp
-; ||||||00-- Another header byte. For each bit starting from MSB
+; MLIissBR
+; |||||||+-- Rotate plane bits (135° reflection)
+; ||||||+--- 0: use bits 'ss' to choose what planes are 0x00
+; ||||||     1: Ignore 'ss' bits and load header byte.
+; ||||||        For each bit starting from MSB
 ; ||||||       0: 0x00 plane
 ; ||||||       1: pb8 plane
-; ||||||01-- L planes: 0x00, M planes:  pb8
-; ||||||10-- L planes:  pb8, M planes: 0x00
-; ||||||11-- All planes: pb8
-; |||||+---- *Deprecated*
-; |||||        set to 1 for backwards compatibility in encoder
-; ||||+----- Rotate plane bits (135° reflection)
+; ||||00---- All planes: 0x00
+; ||||01---- L planes: 0x00, M planes:  pb8
+; ||||10---- L planes:  pb8, M planes: 0x00
+; ||||11---- All planes: pb8
 ; |||+------ L planes predict from 0xff
 ; ||+------- M planes predict from 0xff
 ; |+-------- L = M XOR L
 ; +--------- M = M XOR L
-; 11111110-- Uncompressed block of 64 bytes
-; 11111111-- Reuse previous block (skip block)
+; 00101010-- Uncompressed block of 64 bytes (bit pattern is ascii '*' )
+; Header >= 0xc0 results in undefined behavior.
+; The calling routine should check the first byte of donut_stream_ptr.
 
 .proc donut_decompress_block
 block_offset        = temp+0
@@ -70,50 +75,36 @@ temp_a              = plane_buffer+0
     ; Reading a byte from the stream pointer will be pre-increment
     ; So save last increment until routine is done
 
-  cmp #$c0
-  bcc do_normal_block
-  do_special_block:
-    and #$01
-    bne skip_block
-    raw_block:
-      raw_block_loop:
-        iny
-        lda (donut_stream_ptr), y
-        sta donut_block_buffer, x
-        inx
-        cpy #65-1  ; size of a raw block, minus pre-increment
-      bcc raw_block_loop
-    skip_block:
-    sty temp_y
-  jmp end_block
-shorthand_plane_def_table:
-  .byte $00, $55, $aa, $ff
+  cmp #$2a
+  beq do_raw_block
   do_normal_block:
     stx block_offset
     sta block_header
-    and #%11101000
+
+    ;,; lda block_header
+    and #%11101111
       ; The 0 are bits selected for the even ("lower") planes
       ; The 1 are bits selected for the odd planes
+      ; bits 0~3 should be set to allow the mask after this to work.
     sta even_odd
       ; even_odd toggles between the 2 fields selected above for each plane.
 
     ;,; lda block_header
-    and #$08
-    beq :+
-      lda #$ff
-    :
-    sta is_rotated
-
-    lda block_header
-    and #$03
-    tax
-    lda shorthand_plane_def_table, x
-    bne read_plane_def_from_stream
+    and #$0f
+    lsr
+    ror is_rotated
+    lsr
+    bcc unpack_shorthand_plane_def
+    read_plane_def_from_stream:
       iny
       lda (donut_stream_ptr), y
-    read_plane_def_from_stream:
+    bcs plane_def_ready  ;,; jmp plane_def_ready
+    unpack_shorthand_plane_def:
+      ;,; and #$03
+      tax
+      lda shorthand_plane_def_table, x
+    plane_def_ready:
     sta plane_def
-
     sty temp_y
 
     lda block_offset
@@ -144,6 +135,19 @@ shorthand_plane_def_table:
           dey
         bne fill_plane_loop
       beq end_plane  ;,; jmp end_plane
+
+    do_raw_block:
+      ;,; ldx block_offset
+      raw_block_loop:
+        iny
+        lda (donut_stream_ptr), y
+        sta donut_block_buffer, x
+        inx
+        cpy #65-1  ; size of a raw block, minus pre-increment
+      bcc raw_block_loop
+      sty temp_y
+    jmp end_block
+
       do_rotated_pb8_plane:
         ldx #8
         buffered_pb8_loop:
@@ -180,6 +184,10 @@ shorthand_plane_def_table:
           dey
         bne flip_bits_loop
       beq end_plane  ;,; jmp end_plane
+
+shorthand_plane_def_table:
+  .byte $00, $55, $aa, $ff
+
       do_pb8_plane:
         sta temp_a
         ldy temp_y
@@ -190,6 +198,7 @@ shorthand_plane_def_table:
 
         bit is_rotated
       bmi do_rotated_pb8_plane
+      ;,; bpl do_normal_pb8_plane
       do_normal_pb8_plane:
         sec
         rol pb8_ctrl
@@ -205,6 +214,7 @@ shorthand_plane_def_table:
         sty temp_y
       ;,; jmp end_plane
       end_plane:
+
       bit even_odd
       bpl not_xor_l_onto_m
         ldy #8
@@ -216,6 +226,7 @@ shorthand_plane_def_table:
           dey
         bne xor_l_onto_m_loop
       not_xor_l_onto_m:
+
       bvc not_xor_m_onto_l
         ldy #8
         xor_m_onto_l_loop:
@@ -226,6 +237,7 @@ shorthand_plane_def_table:
           dey
         bne xor_m_onto_l_loop
       not_xor_m_onto_l:
+
       lda block_offset
       cmp block_offset_end
     beq plane_loop_skip
