@@ -445,22 +445,25 @@ int main (int argc, char **argv)
         output_file = stdout;
     } else {
         fclose(stdout);
-        if (force_overwrite == true) {
-            output_file = fopen(output_filename, "wb");
-        } else {
-            output_file = fopen(output_filename, "wbx");
-            if ((errno == EEXIST) && (!quiet_flag) && (number_of_stdin_args <= 0)) {
+        if (!force_overwrite) {
+            /* open output for read to check for file existence. */
+            output_file = fopen(output_filename, "rb");
+            if (output_file != NULL) {
+                fclose(output_file);
+                output_file = NULL;
                 fputs(output_filename, stderr);
                 fputs(" already exists; do you wish to overwrite (y/N) ? ", stderr);
                 c = fgetc(stdin);
-                if (c == 'y' || c == 'Y'){
-                    errno = 0;
-                    output_file = fopen(output_filename, "wb");
-                } else {
+                if (c != 'y' && c != 'Y'){
                     fputs("    not overwritten\n", stderr);
                     exit(EXIT_FAILURE);
                 }
+            } else if (errno == ENOENT) {
+                errno = 0;
             }
+        }
+        if (errno == 0) {
+            output_file = fopen(output_filename, "wb");
         }
         if (output_file == NULL) {
             if (!quiet_flag)
