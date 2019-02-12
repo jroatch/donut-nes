@@ -268,6 +268,10 @@ rts
 PPU_DATA = $2007
   stx donut_block_count
   block_loop:
+    ldy #$00
+    lda (donut_stream_ptr), y
+    cmp #$c0
+    bcs end_block_upload
     ldx #64
     jsr donut_decompress_block
     ldx #64
@@ -278,5 +282,6 @@ PPU_DATA = $2007
     bpl upload_loop
     ldx donut_block_count
   bne block_loop
+end_block_upload:
 rts
 .endproc
