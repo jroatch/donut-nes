@@ -16,6 +16,8 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # Version History:
+# 2019-02-15: Swapped the M and L bits, for conceptual consistency.
+#             Also rearranged branches for speed.
 # 2019-02-07: Removed "Duplicate" block type, and moved
 #             Uncompressed block to below 0xc0 to make room
 #             for block handling commands in the 0xc0~0xff space
@@ -34,10 +36,10 @@ The coded block starts with a 1 or 2 byte header,
 followed by at most 8 pb8 packets.
 
 Block header:
-MLIissBR
+LMlmbbBR
 |||||||+-- Rotate plane bits (135° reflection)
-||||||+--- 0: use bits 'ss' to choose what planes are 0x00
-||||||     1: Ignore 'ss' bits and load header byte.
+||||||+--- 0: use bits 'bb' to choose what planes are 0x00
+||||||     1: Ignore 'bb' bits and load header byte.
 ||||||        For each bit starting from MSB
 ||||||       0: 0x00 plane
 ||||||       1: pb8 plane
@@ -45,10 +47,10 @@ MLIissBR
 ||||01---- L planes: 0x00, M planes:  pb8
 ||||10---- L planes:  pb8, M planes: 0x00
 ||||11---- All planes: pb8
-|||+------ L planes predict from 0xff
-||+------- M planes predict from 0xff
-|+-------- L = M XOR L
-+--------- M = M XOR L
+|||+------ M planes predict from 0xff
+||+------- L planes predict from 0xff
+|+-------- M = M XOR L
++--------- L = M XOR L
 00101010-- Uncompressed block of 64 bytes (bit pattern is ascii '*' )
 
 Header >= 0xc0 are Reserved, and currently results in a error.
@@ -101,9 +103,9 @@ def cblock_cost(cblock):
     block_header = cblock[0]
     cblock_len = len(cblock)
     if block_header == 0x2a:
-        cycles = 1265
+        cycles = 1262
     else:
-        cycles = 1281
+        cycles = 1285
         bytes_accounted = 1
         if block_header & 0x10:
             cycles += 4
@@ -112,16 +114,16 @@ def cblock_cost(cblock):
         if block_header & 0x02:
             plane_def = cblock[1]
             bytes_accounted += 1
-            cycles += 3
+            cycles += 5
         else:
             plane_def = [0x00,0x55,0xaa,0xff][(block_header>>2) & 0x03]
         pb8_count = bin(plane_def).count("1")
         bytes_accounted += pb8_count
         cycles += (cblock_len-bytes_accounted) * 6
         if block_header & 0x01:
-            cycles += pb8_count * 617
+            cycles += pb8_count * 610
         else:
-            cycles += pb8_count * 78
+            cycles += pb8_count * 74
         if block_header & 0xc0:
             cycles += 640
     return (cblock_len*8192 + cycles)*256 + block_header
@@ -163,9 +165,9 @@ def decompress_single_block(cblock, allow_partial=False):
         is_M_plane = False
         for block_offset in range(0,64,8):
             cur_byte = 0x00
-            if block_header & 0x20 and is_M_plane:
+            if block_header & 0x10 and is_M_plane:
                 cur_byte = 0xff
-            if block_header & 0x10 and not is_M_plane:
+            if block_header & 0x20 and not is_M_plane:
                 cur_byte = 0xff
             plane[0:8] = [cur_byte]*8
             if plane_def & 0x80:
@@ -197,9 +199,9 @@ def decompress_single_block(cblock, allow_partial=False):
             if is_M_plane:
                 for i in range(8):
                     plane[i] = block[block_offset + i - 8] ^ block[block_offset + i]
-                if block_header & 0x40:
-                    block[block_offset-8:block_offset] = plane
                 if block_header & 0x80:
+                    block[block_offset-8:block_offset] = plane
+                if block_header & 0x40:
                     block[block_offset:block_offset+8] = plane
             plane_def = (plane_def << 1) & 0xff
             is_M_plane = not is_M_plane
@@ -241,22 +243,22 @@ def compress_single_block(block, dont_care_mask=b'\xff'*64, use_bit_flip=True):
             plane_def = plane_def << 2
             if attempt_type & 0x01:
                 plane_l, plane_m = flip_plane_bits_135(plane_l), flip_plane_bits_135(plane_m)
-            top_value_l = 0xff if attempt_type & 0x10 else 0x00
-            top_value_m = 0xff if attempt_type & 0x20 else 0x00
+            top_value_l = 0xff if attempt_type & 0x20 else 0x00
+            top_value_m = 0xff if attempt_type & 0x10 else 0x00
             if mask_l != b'\xff'*8 or mask_m != b'\xff'*8:
                 if attempt_type & 0x01:
                     mask_l, mask_m = flip_plane_bits_135(mask_l), flip_plane_bits_135(mask_m)
                 plane_l = fill_dont_care_bits(plane_l, mask_l, top_value_l)
                 plane_m = fill_dont_care_bits(plane_m, mask_m, top_value_m)
-                if attempt_type & 0x40:
-                    plane_l = fill_dont_care_bits(plane_l, mask_l, top_value_l, plane_m)
                 if attempt_type & 0x80:
+                    plane_l = fill_dont_care_bits(plane_l, mask_l, top_value_l, plane_m)
+                if attempt_type & 0x40:
                     plane_m = fill_dont_care_bits(plane_m, mask_m, top_value_m, plane_l)
             if attempt_type & 0xc0 != 0x00:
                 plane_xor = bytes(l^m for l , m in zip(plane_l, plane_m))
-                if attempt_type & 0x40:
-                    plane_l = plane_xor
                 if attempt_type & 0x80:
+                    plane_l = plane_xor
+                if attempt_type & 0x40:
                     plane_m = plane_xor
             cplane_l = pb8_pack_plane(plane_l, top_value_l)
             if cplane_l != b'\x00':
@@ -387,7 +389,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description='Donut NES Codec', usage='%(prog)s [options] [-d] input [-o] output')
-    parser.add_argument('--version', action='version', version='%(prog)s 1.5')
+    parser.add_argument('--version', action='version', version='%(prog)s 1.6')
     parser.add_argument('input', metavar='files', help='Input files', nargs='*')
     parser.add_argument('-d', '--decompress', help='decompress the input files', action='store_true')
     parser.add_argument('-o', '--output', metavar='FILE', help='output to FILE instead of last positional argument')
