@@ -60,7 +60,7 @@ donut_block_count:      .res 1
 ; Header >= 0xc0: Error, avaliable for outside processing.
 ;
 ; Trashes Y, A, temp 0 ~ temp 15.
-; bytes: 246, cycles: 1262 ~ 7137(compressor limit) or 7202(actual max).
+; bytes: 246, cycles: 1262 ~ 7137(compressor limit) or 7200(actual max).
 .proc donut_decompress_block
 plane_buffer        = temp+0 ; 8 bytes
 pb8_ctrl            = temp+8
@@ -89,15 +89,14 @@ do_normal_block:
   cmp #$c0
   bcc continue_normal_block
   ;,; bcs exit_error
+exit_error:
+rts
+; If we don't exit here, xor_l_onto_m can underflow into zeropage.
 
 ; I'm inserting these things here instead of above the donut_decompress_block
 ; at the cost of 1 cycle with the continue_normal_block branch for these reasons:
 ; The start of the main routine remains at the start of the .proc scope
 ; and I can save 1 byte with 'bcs end_block'
-
-exit_error:
-rts
-; If we don't exit here, xor_l_onto_m can underflow into zeropage.
 
 shorthand_plane_def_table:
   .byte $00, $55, $aa, $ff
@@ -132,14 +131,13 @@ continue_normal_block:
     ; even_odd toggles between the 2 fields selected above for each plane.
 
   ;,; lda block_header
-  and #$0f
   lsr
   ror is_rotated
   lsr
   bcs read_plane_def_from_stream
   ;,; bcc unpack_shorthand_plane_def
   unpack_shorthand_plane_def:
-    ;,; and #$03
+    and #$03
     tax
     lda shorthand_plane_def_table, x
   plane_def_ready:

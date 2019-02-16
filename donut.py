@@ -114,7 +114,7 @@ def cblock_cost(cblock):
         if block_header & 0x02:
             plane_def = cblock[1]
             bytes_accounted += 1
-            cycles += 5
+            cycles += 3
         else:
             plane_def = [0x00,0x55,0xaa,0xff][(block_header>>2) & 0x03]
         pb8_count = bin(plane_def).count("1")

@@ -147,7 +147,7 @@ int cblock_cost(uint8_t *p, int l) {
             return 0;
         plane_def = *(p+1);
         --l;
-        cycles += 5;
+        cycles += 3;
     } else {
         plane_def = short_defs[(block_header & 0x0c) >> 2];
     }
