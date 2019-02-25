@@ -43,24 +43,29 @@ donut_block_count:      .res 1
 ; Block header:
 ; LMlmbbBR
 ; |||||||+-- Rotate plane bits (135° reflection)
-; ||||||+--- 0: use bits 'bb' to choose what planes are 0x00
-; ||||||     1: Ignore 'bb' bits and load header byte.
-; ||||||        For each bit starting from MSB
-; ||||||       0: 0x00 plane
-; ||||||       1: pb8 plane
-; ||||00---- All planes: 0x00
-; ||||01---- L planes: 0x00, M planes:  pb8
-; ||||10---- L planes:  pb8, M planes: 0x00
-; ||||11---- All planes: pb8
+; ||||000--- All planes: 0x00
+; ||||010--- L planes: 0x00, M planes:  pb8
+; ||||100--- L planes:  pb8, M planes: 0x00
+; ||||110--- All planes: pb8
+; ||||001--- In another header byte, For each bit starting from MSB
+; ||||         0: 0x00 plane
+; ||||         1: pb8 plane
+; ||||011--- In another header byte, Decode only 1 pb8 plane and
+; ||||       duplicate it for each bit starting from MSB
+; ||||         0: 0x00 plane
+; ||||         1: duplicated plane
+; ||||       If extra header byte = 0x00, no pb8 plane is decoded.
+; ||||1xx--- Reserved for Uncompressed block bit pattern
 ; |||+------ M planes predict from 0xff
 ; ||+------- L planes predict from 0xff
 ; |+-------- M = M XOR L
 ; +--------- L = M XOR L
 ; 00101010-- Uncompressed block of 64 bytes (bit pattern is ascii '*' )
 ; Header >= 0xc0: Error, avaliable for outside processing.
+; X >= 192: Also returns in Error, the buffer would of unexpectedly page warp.
 ;
 ; Trashes Y, A, temp 0 ~ temp 15.
-; bytes: 246, cycles: 1262 ~ 7137(compressor limit) or 7200(actual max).
+; bytes: 256, cycles: 1269 ~ 7238.
 .proc donut_decompress_block
 plane_buffer        = temp+0 ; 8 bytes
 pb8_ctrl            = temp+8
@@ -75,12 +80,12 @@ is_rotated          = temp+14
   txa
   clc
   adc #64
+  bcs exit_error
   sta block_offset_end
 
   ldy #$00
   lda (donut_stream_ptr), y
-    ; Reading a byte from the stream pointer will be pre-increment
-    ; So save the last increment until routine is done
+  iny  ; Reading input bytes are now post-increment.
 
   cmp #$2a
   beq do_raw_block
@@ -102,18 +107,19 @@ shorthand_plane_def_table:
   .byte $00, $55, $aa, $ff
 
 read_plane_def_from_stream:
-  iny
+  ror
   lda (donut_stream_ptr), y
-bcs plane_def_ready  ;,; jmp plane_def_ready
+  iny
+bne plane_def_ready  ;,; jmp plane_def_ready
 
 do_raw_block:
   ;,; ldx block_offset
   raw_block_loop:
-    iny
     lda (donut_stream_ptr), y
+    iny
     sta donut_block_buffer, x
     inx
-    cpy #65-1  ; size of a raw block, minus pre-increment
+    cpy #65  ; size of a raw block
   bcc raw_block_loop
   sty temp_y
 bcs end_block  ;,; jmp end_block
@@ -141,12 +147,13 @@ continue_normal_block:
     tax
     lda shorthand_plane_def_table, x
   plane_def_ready:
+  ror is_rotated
   sta plane_def
   sty temp_y
 
+  clc
   lda block_offset
   plane_loop:
-    clc
     adc #8
     sta block_offset
 
@@ -165,24 +172,28 @@ continue_normal_block:
     bcc do_zero_plane
     ;,; bcs do_pb8_plane
   do_pb8_plane:
-    tax
     ldy temp_y
-    iny
+    bit is_rotated
+    bpl no_rewind_input_pointer
+      ldy #$02
+    no_rewind_input_pointer:
+    tax
     lda (donut_stream_ptr), y
+    iny
     sta pb8_ctrl
     txa
 
-    bit is_rotated
-  bmi do_rotated_pb8_plane
-  ;,; bpl do_normal_pb8_plane
+    ;,; bit is_rotated
+  bvs do_rotated_pb8_plane
+  ;,; bvc do_normal_pb8_plane
   do_normal_pb8_plane:
     ldx block_offset
-    sec
+    ;,; sec  ; C is set from 'asl plane_def' above
     rol pb8_ctrl
     pb8_loop:
       bcc pb8_use_prev
-        iny
         lda (donut_stream_ptr), y
+        iny
       pb8_use_prev:
       dex
       sta donut_block_buffer, x
@@ -218,16 +229,17 @@ continue_normal_block:
 
     lda block_offset
     cmp block_offset_end
-  bne plane_loop
-  tax  ;,; ldx block_offset_end
+  bcc plane_loop
 end_block:
-  sec  ; Add 1 to finalize the pre-increment setup
+  ;,; sec
+  clc
   lda temp_y
   adc donut_stream_ptr+0
   sta donut_stream_ptr+0
   bcc add_stream_ptr_no_inc_high_byte
     inc donut_stream_ptr+1
   add_stream_ptr_no_inc_high_byte:
+  ldx block_offset_end
   dec donut_block_count
 rts
 
@@ -246,8 +258,8 @@ do_rotated_pb8_plane:
   buffered_pb8_loop:
     asl pb8_ctrl
     bcc buffered_pb8_use_prev
-      iny
       lda (donut_stream_ptr), y
+      iny
     buffered_pb8_use_prev:
     dex
     sta plane_buffer, x
