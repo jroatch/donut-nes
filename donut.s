@@ -55,7 +55,7 @@ donut_block_count:      .res 1
 ; ||||         0: 0x00 plane
 ; ||||         1: duplicated plane
 ; ||||       If extra header byte = 0x00, no pb8 plane is decoded.
-; ||||1xx--- Reserved for Uncompressed block bit pattern
+; ||||1x1--- Reserved for Uncompressed block bit pattern
 ; |||+------ M planes predict from 0xff
 ; ||+------- L planes predict from 0xff
 ; |+-------- M = M XOR L

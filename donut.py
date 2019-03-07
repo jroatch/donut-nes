@@ -38,15 +38,19 @@ followed by at most 8 pb8 packets.
 Block header:
 LMlmbbBR
 |||||||+-- Rotate plane bits (135° reflection)
-||||||+--- 0: use bits 'bb' to choose what planes are 0x00
-||||||     1: Ignore 'bb' bits and load header byte.
-||||||        For each bit starting from MSB
-||||||       0: 0x00 plane
-||||||       1: pb8 plane
-||||00---- All planes: 0x00
-||||01---- L planes: 0x00, M planes:  pb8
-||||10---- L planes:  pb8, M planes: 0x00
-||||11---- All planes: pb8
+||||000--- All planes: 0x00
+||||010--- L planes: 0x00, M planes:  pb8
+||||100--- L planes:  pb8, M planes: 0x00
+||||110--- All planes: pb8
+||||001--- In another header byte, For each bit starting from MSB
+||||         0: 0x00 plane
+||||         1: pb8 plane
+||||011--- In another header byte, Decode only 1 pb8 plane and
+||||       duplicate it for each bit starting from MSB
+||||         0: 0x00 plane
+||||         1: duplicated plane
+||||       If extra header byte = 0x00, no pb8 plane is decoded.
+||||1x1--- Reserved for Uncompressed block bit pattern
 |||+------ M planes predict from 0xff
 ||+------- L planes predict from 0xff
 |+-------- M = M XOR L
@@ -99,34 +103,45 @@ def flip_plane_bits_135(plane):
     return bytes(sum(((plane[x] >> y)&0b1) << x for x in range(8)) for y in range(8))
 
 def cblock_cost(cblock):
-    cycles = 0
+    l = len(cblock)
+    if (l < 1):
+        return 0
     block_header = cblock[0]
-    cblock_len = len(cblock)
-    if block_header == 0x2a:
-        cycles = 1262
+    l -= 1
+    if (block_header >= 0xc0):
+        return 0
+    if (block_header == 0x2a):
+        return (len(cblock)*8192 + 1269)*256 + block_header
+    cycles = 1281
+    if (block_header & 0xc0):
+        cycles += 640
+    if (block_header & 0x20):
+        cycles += 4
+    if (block_header & 0x10):
+        cycles += 4
+    if (block_header & 0x02):
+        if (l < 1):
+            return 0
+        plane_def = cblock[1]
+        l -= 1
+        cycles += 5
+        decode_only_1_pb8_plane = ((block_header & 0x04) and (plane_def != 0x00))
     else:
-        cycles = 1285
-        bytes_accounted = 1
-        if block_header & 0x10:
-            cycles += 4
-        if block_header & 0x20:
-            cycles += 4
-        if block_header & 0x02:
-            plane_def = cblock[1]
-            bytes_accounted += 1
-            cycles += 3
-        else:
-            plane_def = [0x00,0x55,0xaa,0xff][(block_header>>2) & 0x03]
-        pb8_count = bin(plane_def).count("1")
-        bytes_accounted += pb8_count
-        cycles += (cblock_len-bytes_accounted) * 6
-        if block_header & 0x01:
-            cycles += pb8_count * 610
-        else:
-            cycles += pb8_count * 74
-        if block_header & 0xc0:
-            cycles += 640
-    return (cblock_len*8192 + cycles)*256 + block_header
+        plane_def = [0x00,0x55,0xaa,0xff][(block_header>>2) & 0x03]
+        decode_only_1_pb8_plane = False
+    pb8_count = bin(plane_def).count("1")
+    if (block_header & 0x01):
+        cycles += pb8_count * 614
+    else:
+        cycles += pb8_count * 75
+    if decode_only_1_pb8_plane:
+        l -= 1
+        cycles += pb8_count
+        cycles += (l * 6 * pb8_count)
+    else:
+        l -= pb8_count
+        cycles += l * 6
+    return (len(cblock)*8192 + cycles)*256 + block_header
 
 def decompress_single_block(cblock, allow_partial=False):
     cblock_iter = iter(cblock)
@@ -160,9 +175,34 @@ def decompress_single_block(cblock, allow_partial=False):
                     raise ValueError("Unexpected end at zero plane flags", bytes_processed)
                 else:
                     plane_def = 0x00
+            decode_only_1_pb8_plane = ((block_header & 0x04) and (plane_def != 0x00));
         else:
             plane_def = [0x00,0x55,0xaa,0xff][(block_header>>2) & 0x03]
+            decode_only_1_pb8_plane = False;
         is_M_plane = False
+        if decode_only_1_pb8_plane:
+            single_pb8_buf = bytearray()
+            try:
+                pb8_flags = next(cblock_iter)
+                bytes_processed += 1
+            except StopIteration:
+                if not allow_partial:
+                    raise ValueError("Unexpected end at pb8 flags of plane {}".format(block_offset//8), bytes_processed)
+                else:
+                    pb8_flags = 0x00
+                    plane_def = 0x00
+            single_pb8_buf.append(pb8_flags)
+            for i in range(bin(pb8_flags).count("1")):
+                try:
+                    cur_byte = next(cblock_iter)
+                    bytes_processed += 1
+                except StopIteration:
+                    if not allow_partial:
+                        raise ValueError("Unexpected end at pb8 byte -{} of plane {}".format(i+1, block_offset//8), bytes_processed)
+                    else:
+                        pb8_flags = 0x00
+                        plane_def = 0x00
+                single_pb8_buf.append(cur_byte)
         for block_offset in range(0,64,8):
             cur_byte = 0x00
             if block_header & 0x10 and is_M_plane:
@@ -171,9 +211,12 @@ def decompress_single_block(cblock, allow_partial=False):
                 cur_byte = 0xff
             plane[0:8] = [cur_byte]*8
             if plane_def & 0x80:
+                if decode_only_1_pb8_plane:
+                    cblock_iter = iter(single_pb8_buf)
                 try:
                     pb8_flags = next(cblock_iter)
-                    bytes_processed += 1
+                    if not decode_only_1_pb8_plane:
+                        bytes_processed += 1
                 except StopIteration:
                     if not allow_partial:
                         raise ValueError("Unexpected end at pb8 flags of plane {}".format(block_offset//8), bytes_processed)
@@ -185,7 +228,8 @@ def decompress_single_block(cblock, allow_partial=False):
                     if pb8_flags & 0x0100:
                         try:
                             cur_byte = next(cblock_iter)
-                            bytes_processed += 1
+                            if not decode_only_1_pb8_plane:
+                                bytes_processed += 1
                         except StopIteration:
                             if not allow_partial:
                                 raise ValueError("Unexpected end at pb8 byte -{} of plane {}".format(i+1, block_offset//8), bytes_processed)
@@ -389,7 +433,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description='Donut NES Codec', usage='%(prog)s [options] [-d] input [-o] output')
-    parser.add_argument('--version', action='version', version='%(prog)s 1.6')
+    parser.add_argument('--version', action='version', version='%(prog)s 1.7')
     parser.add_argument('input', metavar='files', help='Input files', nargs='*')
     parser.add_argument('-d', '--decompress', help='decompress the input files', action='store_true')
     parser.add_argument('-o', '--output', metavar='FILE', help='output to FILE instead of last positional argument')
