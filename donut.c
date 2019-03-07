@@ -169,6 +169,20 @@ int cblock_cost(uint8_t *p, int l) {
     return cycles;
 }
 
+bool all_pb8_planes_match(uint8_t *p, int pb8_length, int number_of_pb8) {
+    int i, c, l;
+    l = number_of_pb8*pb8_length;
+    for (c = 0, i = pb8_length; i < l; ++i, ++c) {
+        if (c >= pb8_length) {
+            c = 0;
+        }
+        if (*(p + c) != *(p + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_block) {
     buffer_pointers p;
     uint64_t plane;
@@ -292,15 +306,16 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip){
     uint64_t plane_predict;
     int shortest_length;
     int least_cost;
-    int a, i, j, r, l;
+    int a, i, r, l;
     uint8_t temp_cblock[74];
     uint8_t *temp_p;
     uint8_t plane_def;
     uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
-    uint8_t *single_pb8;
-    int single_plane_state;
-    int single_pb8_length;
-    uint64_t single_plane;
+    bool planes_match;
+    bool pb8_planes_match;
+    uint64_t first_non_zero_plane;
+    int number_of_pb8_planes;
+    int first_pb8_length;
     p = *(result_p);
     while ((p.source.end - p.source.begin >= 64) && (p.source.begin - p.destination.end >= 65)) {
         *(p.destination.end) = 0x2a;
@@ -324,10 +339,7 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip){
             for (a = 0; a < 0xc; ++a) {
                 temp_p = temp_cblock + 2;
                 plane_def = 0x00;
-                single_plane_state = 0x8;
-                single_plane = 0;
-                single_pb8 = NULL;
-                single_pb8_length = 0;
+                number_of_pb8_planes = 0;
                 for (i = 0; i < 8; ++i) {
                     plane = block[i];
                     if ((i & 1) == 0) {
@@ -344,57 +356,43 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip){
                     plane_def <<= 1;
                     if (plane != plane_predict) {
                         l = pack_pb8(temp_p, plane, (uint8_t)plane_predict);
-                        if (single_plane_state != 0) {
-                            if (single_plane_state == 0x8) {
-                                single_plane = plane;
-                                single_pb8 = temp_p;
-                                single_pb8_length = l;
-                                single_plane_state = 0x4;
-                            } else {
-                                if (single_plane_state == 0x4) {
-                                    single_plane_state = 0x3;
-                                }
-                                if ((single_plane_state & 0x1) && (single_plane != plane)) {
-                                    single_plane_state &= ~0x1;
-                                }
-                                if (single_plane_state & 0x2) {
-                                    if (single_pb8_length != l) {
-                                        single_plane_state &= ~0x2;
-                                    } else {
-                                        for (j = 0; j < l; ++j) {
-                                            if (*(temp_p+j) != *(single_pb8+j)) {
-                                                single_plane_state &= ~0x2;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         temp_p += l;
                         plane_def |= 1;
+                        if (number_of_pb8_planes == 0) {
+                            planes_match = true;
+                            first_non_zero_plane = plane;
+                            first_pb8_length = l;
+                        } else if (first_non_zero_plane != plane) {
+                            planes_match = false;
+                        }
+                        ++number_of_pb8_planes;
                     }
                 }
-                if (single_plane_state & 0x2) {
-                    temp_cblock[0] = r | (a<<4) | 0x06;
-                    temp_cblock[1] = plane_def;
-                    temp_p = temp_cblock;
-                    l = 2 + single_pb8_length;
-                } else if (single_plane_state & 0x1) {
-                    temp_cblock[0] = r | (a<<4) | 0x06;
-                    temp_cblock[1] = plane_def;
-                    temp_p = temp_cblock;
-                    l = pack_pb8(temp_cblock+2, single_plane, ~(uint8_t)single_plane);
-                    l += 2;
+                temp_cblock[0] = r | (a<<4) | 0x02;
+                temp_cblock[1] = plane_def;
+                l = temp_p - temp_cblock;
+                temp_p = temp_cblock;
+                if (number_of_pb8_planes <= 1) {
+                    planes_match = false;
+                    pb8_planes_match = false;
                 } else {
-                    temp_cblock[0] = r | (a<<4) | 0x02;
-                    temp_cblock[1] = plane_def;
-                    l = temp_p - temp_cblock;
-                    temp_p = temp_cblock;
+                    if (first_pb8_length * number_of_pb8_planes == l-2) {
+                        pb8_planes_match = all_pb8_planes_match(temp_p+2, first_pb8_length, number_of_pb8_planes);
+                    } else {
+                        pb8_planes_match = false;
+                    }
+                }
+                if (pb8_planes_match) {
+                    *(temp_p + 0) = r | (a<<4) | 0x06;
+                    l = 2 + first_pb8_length;
+                } else if (planes_match) {
+                    *(temp_p + 0) = r | (a<<4) | 0x06;
+                    l = 2 + pack_pb8(temp_p+2, first_non_zero_plane, ~(uint8_t)first_non_zero_plane);
+                } else {
                     for (i = 0; i < 4; ++i) {
                         if (plane_def == short_defs[i]) {
-                            temp_cblock[1] = r | (a<<4) | (i << 2);
                             ++temp_p;
+                            *(temp_p + 0) = r | (a<<4) | (i << 2);
                             --l;
                             break;
                         }
@@ -652,9 +650,6 @@ int main (int argc, char **argv)
                 perror(input_filename);
             errno = 0;
         }
-        /* if more then 1 input */
-        /* print file ratio here */
-        /* print("{} :{:>6.1%} ({} => {} bytes, {})".format(input_file.file_name, ratio, r, w, output_file.file_name), file=sys.stderr) */
         ++optind;
     }
     if (p.source.end - p.source.begin > 0) {
