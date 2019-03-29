@@ -1,6 +1,6 @@
 #include <stdio.h>   /* I/O */
 #include <errno.h>   /* errno */
-#include <stdlib.h>  /* exit() */
+#include <stdlib.h>  /* exit(), strtol() */
 #include <stdbool.h> /* bool */
 #include <stddef.h>  /* null */
 #include <stdint.h>  /* uint8_t */
@@ -28,6 +28,7 @@ const char *HELP_TEXT =
     "  -f, --force            overwrite output without prompting\n"
     "  -q, --quiet            suppress messages and completion stats\n"
     "  --no-bit-flip          don't encode blocks that requires rotation\n"
+    "  --cycle-limit INT      limits the 6502 decoding time for each encoded block\n"
 ;
 
 /* According to a strace of cat on my system, and a quick dd of dev/zero:
@@ -299,7 +300,7 @@ void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_
     return;
 }
 
-void compress_blocks(buffer_pointers *result_p, bool use_bit_flip){
+void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_limit){
     buffer_pointers p;
     uint64_t block[8];
     uint64_t plane;
@@ -400,7 +401,7 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip){
                 }
                 if (l <= shortest_length) {
                     i = cblock_cost(temp_p, l);
-                    if ((l < shortest_length) || (i < least_cost)) {
+                    if ((i <= cycle_limit) && ((l < shortest_length) || (i < least_cost))) {
                         memmove(p.destination.end, temp_p, l);
                         shortest_length = l;
                         least_cost = i;
@@ -437,6 +438,8 @@ int main (int argc, char **argv)
     buffer_pointers p = {NULL};
     size_t l;
 
+    int cycle_limit = 10000;
+
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -450,6 +453,7 @@ int main (int argc, char **argv)
             {"force",       no_argument,        NULL,   'f'},
             {"quiet",       no_argument,        NULL,   'q'},
             {"no-bit-flip", no_argument,        NULL,   'b'+256},
+            {"cycle-limit", required_argument, NULL,   'y'+256},
             {NULL, 0, NULL, 0}
         };
         /* getopt_long stores the option index here. */
@@ -486,6 +490,13 @@ int main (int argc, char **argv)
 
         break; case 'b'+256:
             no_bit_flip_blocks = true;
+
+        break; case 'y'+256:
+            cycle_limit = strtol(optarg, NULL, 0);
+            if (cycle_limit < 1269) {
+                fputs("Invalid parameter for --cycle-limit. Must be a integer >= 1269.\n", stderr);
+                exit(EXIT_FAILURE);
+            }
 
         break; case '?':
             /* getopt_long already printed an error message. */
@@ -614,7 +625,7 @@ int main (int argc, char **argv)
                 if (decompress) {
                     decompress_blocks(&p, false, false);
                 } else {
-                    compress_blocks(&p, !no_bit_flip_blocks);
+                    compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
                 }
 
                 while ((p.destination.end - p.destination.begin) >= BUF_IO_SIZE) {
@@ -656,7 +667,7 @@ int main (int argc, char **argv)
         if (decompress) {
             decompress_blocks(&p, true, true);
         } else {
-            compress_blocks(&p, !no_bit_flip_blocks);
+            compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
         }
     }
     l = (size_t)(p.destination.end - p.destination.begin);
