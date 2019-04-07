@@ -67,14 +67,19 @@ typedef struct buffer_pointers {
 
 uint64_t flip_plane_bits_135(uint64_t plane) {
     uint64_t result = 0;
-    int i, t;
+    uint64_t t;
+    int i;
     if (plane == 0xffffffffffffffff)
         return plane;
     if (plane == 0x0000000000000000)
         return plane;
-    for (i = 0; i < 64; ++i) {
-        t = (((i & 0x07) << 3) | ((i & 0x38) >> 3));
-        result |= ((plane >> t) & 1) << i;
+    for (i = 0; i < 8; ++i) {
+        t = plane >> i;
+        t &= 0x0101010101010101;
+        t *= 0x0102040810204080;
+        t >>= 56;
+        t &= 0xff;
+        result |= t << (i*8);
     }
     return result;
 }
