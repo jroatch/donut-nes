@@ -12,23 +12,23 @@ const char *HELP_TEXT =
     "Donut NES CHR Codec\n"
     "\n"
     "Usage:\n"
-    "  donut [options] [--] INPUT... OUTPUT\n"
-    "  donut -d [options] [--] INPUT... OUTPUT\n"
-    "  donut [-d] [options] -o OUTPUT INPUT...\n"
+    "  donut [-d] [options] INPUT [-o] OUTPUT\n"
     "  donut -h | --help\n"
     "  donut --version\n"
     "\n"
     "Options:\n"
     "  -h --help              show this help message and exit\n"
     "  --version              show program's version number and exit\n"
-    "  -d, --decompress       decompress the input files\n"
+    "  -z, --compress         compress input file [default action]\n"
+    "  -d, --decompress       decompress input file\n"
     "  -o FILE, --output=FILE\n"
-    "                         output to FILE instead of last positional argument\n"
-    "                         FILE can be \'-\' to indicate stdin and stdout\n"
+    "                         output to FILE instead of second positional argument\n"
+    "  -c --stdout            use standard input/output when filenames are absent\n"
     "  -f, --force            overwrite output without prompting\n"
-    "  -q, --quiet            suppress messages and completion stats\n"
-    "  --no-bit-flip          don't encode blocks that requires rotation\n"
-    "  --cycle-limit INT      limits the 6502 decoding time for each encoded block\n"
+    "  -q, --quiet            suppress error messages\n"
+    "  --no-bit-flip          don't encode bit rotated blocks\n"
+    "  --cycle-limit INT      limits the 6502 decoding time for each encoded block,\n"
+    "                         must be at least 1269\n"
 ;
 
 /* According to a strace of cat on my system, and a quick dd of dev/zero:
@@ -175,9 +175,13 @@ int cblock_cost(uint8_t *p, int l) {
     return cycles;
 }
 
-bool all_pb8_planes_match(uint8_t *p, int pb8_length, int number_of_pb8) {
+bool all_pb8_planes_match(uint8_t *p, int pb8_length, int number_of_pb8_planes) {
     int i, c, l;
-    l = number_of_pb8*pb8_length;
+    if (number_of_pb8_planes <= 1) {
+        return false;
+        /* a normal block of 1 plane is cheaper to decode */
+    }
+    l = number_of_pb8_planes*pb8_length;
     for (c = 0, i = pb8_length; i < l; ++i, ++c) {
         if (c >= pb8_length) {
             c = 0;
@@ -318,7 +322,6 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
     uint8_t plane_def;
     uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
     bool planes_match;
-    bool pb8_planes_match;
     uint64_t first_non_zero_plane;
     int number_of_pb8_planes;
     int first_pb8_length;
@@ -346,17 +349,20 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                 temp_p = temp_cblock + 2;
                 plane_def = 0x00;
                 number_of_pb8_planes = 0;
+                planes_match = true;
+                first_pb8_length = 0;
+                first_non_zero_plane = 0;
                 for (i = 0; i < 8; ++i) {
                     plane = block[i];
-                    if ((i & 1) == 0) {
-                        plane_predict = (a & 0x2) ? 0xffffffffffffffff : 0x0000000000000000;
-                        if (a & 0x8) {
-                            plane ^= block[i+1];
-                        }
-                    } else {
+                    if (i & 1) {
                         plane_predict = (a & 0x1) ? 0xffffffffffffffff : 0x0000000000000000;
                         if (a & 0x4) {
                             plane ^= block[i-1];
+                        }
+                    } else {
+                        plane_predict = (a & 0x2) ? 0xffffffffffffffff : 0x0000000000000000;
+                        if (a & 0x8) {
+                            plane ^= block[i+1];
                         }
                     }
                     plane_def <<= 1;
@@ -365,7 +371,6 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                         temp_p += l;
                         plane_def |= 1;
                         if (number_of_pb8_planes == 0) {
-                            planes_match = true;
                             first_non_zero_plane = plane;
                             first_pb8_length = l;
                         } else if (first_non_zero_plane != plane) {
@@ -374,21 +379,16 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                         ++number_of_pb8_planes;
                     }
                 }
+                if (number_of_pb8_planes <= 1) {
+                    planes_match = false;
+                    /* a normal block of 1 plane is cheaper to decode,
+                       and may even be smaller. */
+                }
                 temp_cblock[0] = r | (a<<4) | 0x02;
                 temp_cblock[1] = plane_def;
                 l = temp_p - temp_cblock;
                 temp_p = temp_cblock;
-                if (number_of_pb8_planes <= 1) {
-                    planes_match = false;
-                    pb8_planes_match = false;
-                } else {
-                    if (first_pb8_length * number_of_pb8_planes == l-2) {
-                        pb8_planes_match = all_pb8_planes_match(temp_p+2, first_pb8_length, number_of_pb8_planes);
-                    } else {
-                        pb8_planes_match = false;
-                    }
-                }
-                if (pb8_planes_match) {
+                if (all_pb8_planes_match(temp_p+2, first_pb8_length, number_of_pb8_planes)) {
                     *(temp_p + 0) = r | (a<<4) | 0x06;
                     l = 2 + first_pb8_length;
                 } else if (planes_match) {
@@ -423,22 +423,19 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
 int main (int argc, char **argv)
 {
     int c;
-    bool have_input_filenames;
-    bool have_output_filename;
+    int verbosity_level = 0;
     char *input_filename = NULL;
     char *output_filename = NULL;
     FILE *input_file = NULL;
     FILE *output_file = NULL;
     bool decompress = false;
     bool force_overwrite = false;
-    bool quiet_flag = false;
+    bool use_stdio_for_data = false;
     bool no_bit_flip_blocks = false;
 
     int total_bytes_in = 0;
     int total_bytes_out = 0;
     /*float total_bytes_ratio = 0.0;*/
-    int i;
-    int number_of_stdin_args = 0;
 
     buffer_pointers p = {NULL};
     size_t l;
@@ -452,10 +449,13 @@ int main (int argc, char **argv)
         static struct option long_options[] =
         {
             {"help",        no_argument,        NULL,   'h'},
-            {"version",     no_argument,        NULL,   'v'},
+            {"version",     no_argument,        NULL,   'V'},
+            {"compress",    no_argument,        NULL,   'z'},
             {"decompress",  no_argument,        NULL,   'd'},
             {"output",      required_argument,  NULL,   'o'},
+            {"stdout",      no_argument,        NULL,   'c'},
             {"force",       no_argument,        NULL,   'f'},
+            {"verbose",     no_argument,        NULL,   'v'}, /* to be used */
             {"quiet",       no_argument,        NULL,   'q'},
             {"no-bit-flip", no_argument,        NULL,   'b'+256},
             {"cycle-limit", required_argument, NULL,   'y'+256},
@@ -464,7 +464,7 @@ int main (int argc, char **argv)
         /* getopt_long stores the option index here. */
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "hvdo:fq",
+        c = getopt_long(argc, argv, "hVzdo:cfvq",
                         long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -476,9 +476,12 @@ int main (int argc, char **argv)
             fputs(HELP_TEXT, stdout);
             exit(EXIT_SUCCESS);
 
-        break; case 'v':
+        break; case 'V':
             fputs(VERSION_TEXT, stdout);
             exit(EXIT_SUCCESS);
+
+        break; case 'z':
+            decompress = false;
 
         break; case 'd':
             decompress = true;
@@ -486,11 +489,18 @@ int main (int argc, char **argv)
         break; case 'o':
             output_filename = optarg;
 
+        break; case 'c':
+            use_stdio_for_data = true;
+
         break; case 'f':
             force_overwrite = true;
 
+        break; case 'v':
+            if (verbosity_level >= 0)
+                ++verbosity_level;
+
         break; case 'q':
-            quiet_flag = true;
+            verbosity_level = -1;
             opterr = 0;
 
         break; case 'b'+256:
@@ -512,42 +522,47 @@ int main (int argc, char **argv)
         }
     }
 
-    if (quiet_flag) {
+    if (verbosity_level < 0) {
         fclose(stderr);
     }
 
+    if ((input_filename == NULL) && (optind < argc)) {
+        input_filename = argv[optind];
+        ++optind;
+    }
+
+    if ((output_filename == NULL) && (optind < argc)) {
+        output_filename = argv[optind];
+        ++optind;
+    }
+
+    if ((input_filename == NULL) && (output_filename == NULL) && (!use_stdio_for_data)) {
+        if (verbosity_level >= 0)
+            fputs("Input and output filenames required. Try --help for more info.\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (input_filename == NULL) {
+        if (use_stdio_for_data) {
+            input_file = stdin;
+        } else {
+            if (verbosity_level >= 0)
+                fputs("input filename required. Try --help for more info.\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+    }
+
     if (output_filename == NULL) {
-        if (argc - optind >= 2) {
-            output_filename = argv[argc-1];
-            --argc;
+        if (use_stdio_for_data) {
+            output_file = stdout;
+        } else {
+            if (verbosity_level >= 0)
+                fputs("output filename required. Try --help for more info.\n", stderr);
+            exit(EXIT_FAILURE);
         }
     }
 
-    have_input_filenames = (argc - optind > 0);
-    have_output_filename = (output_filename != NULL);
-    if (!have_input_filenames) {
-        if (!quiet_flag) {
-            if (!have_output_filename)
-                fputs("Input and output filenames required. Try --help for more info.\n", stderr);
-            else
-                fputs("Input filenames required. Try --help for more info.\n", stderr);
-        }
-        exit(EXIT_FAILURE);
-    } else if (!have_output_filename) {
-        if (!quiet_flag)
-            fputs("Output file required. Try --help for more info.\n", stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    for (i = optind; i < argc; ++i){
-        if (strcmp(argv[i], "-") == 0) {
-            ++number_of_stdin_args;
-        }
-    }
-
-    if (strcmp(output_filename, "-") == 0) {
-        output_file = stdout;
-    } else {
+    if (output_filename != NULL) {
         fclose(stdout);
         if (!force_overwrite) {
             /* open output for read to check for file existence. */
@@ -555,119 +570,112 @@ int main (int argc, char **argv)
             if (output_file != NULL) {
                 fclose(output_file);
                 output_file = NULL;
-                if (number_of_stdin_args <= 0) {
-                    if (!quiet_flag) {
-                        fputs(output_filename, stderr);
-                        fputs(" already exists; do you wish to overwrite (y/N) ? ", stderr);
+                if (verbosity_level >= 0) {
+                    fputs(output_filename, stderr);
+                    fputs(" already exists;", stderr);
+                    if (!use_stdio_for_data) {
+                        fputs(" do you wish to overwrite (y/N) ? ", stderr);
                         c = fgetc(stdin);
-                        if (c != 'y' && c != 'Y'){
+                        if (c != '\n') {
+                            while (true) {
+                                if (fgetc(stdin) == '\n')
+                                    break; /* read until the newline */
+                            }
+                        }
+                        if (c == 'y' || c == 'Y') {
+                            force_overwrite = true;
+                        } else {
                             fputs("    not overwritten\n", stderr);
-                            exit(EXIT_FAILURE);
                         }
                     } else {
-                        exit(EXIT_FAILURE);
+                        fputs(" not overwritten\n", stderr);
                     }
-                } else {
-                    if (!quiet_flag) {
-                        fputs(output_filename, stderr);
-                        fputs(" already exists; not overwritten\n", stderr);
-                    }
-                    exit(EXIT_FAILURE);
                 }
-            } else if ((output_file == NULL) && (errno == ENOENT)) {
-                errno = 0;
             }
         }
-        if (errno == 0) {
+        if ((errno == ENOENT) || (force_overwrite)) {
+            /* "No such file or directory" means the name is usable */
+            errno = 0;
             output_file = fopen(output_filename, "wb");
-        }
-        if (output_file == NULL) {
-            if (!quiet_flag)
-                perror(output_filename);
+            if (output_file == NULL) {
+                if (verbosity_level >= 0)
+                    perror(output_filename);
+                exit(EXIT_FAILURE);
+            }
+            setvbuf(output_file, NULL, _IONBF, 0);
+        } else {
+            /* error message printed above */
             exit(EXIT_FAILURE);
         }
-        setvbuf(output_file, NULL, _IONBF, 0);
+    }
+
+    if (input_filename != NULL) {
+        fclose(stdin);
+        input_file = fopen(input_filename, "rb");
+        if (input_file == NULL) {
+            if (verbosity_level >= 0)
+                perror(input_filename);
+            exit(EXIT_FAILURE);
+        }
+        setvbuf(input_file, NULL, _IONBF, 0);
     }
 
     p.source.begin = INPUT_BEGIN;
     p.source.end = INPUT_BEGIN;
     p.destination.begin = OUTPUT_BEGIN;
     p.destination.end = OUTPUT_BEGIN;
-    if (number_of_stdin_args <= 0) {
-        fclose(stdin);
-    }
-    while ((optind < argc) && (!ferror(output_file))) {
-        input_filename = argv[optind];
-        if ((number_of_stdin_args > 0) && (strcmp(input_filename, "-") == 0)) {
-            input_file = stdin;
-        } else {
-            input_file = fopen(input_filename, "rb");
-        }
-        if (input_file != NULL) {
-            setvbuf(input_file, NULL, _IONBF, 0);
-            while(!feof(input_file) && !ferror(input_file) && !ferror(output_file)) {
-                l = (size_t)(p.source.end - p.source.begin);
-                if (l <= BUF_GAP_SIZE) {
-                    if (l > 0) {
-                        memmove(INPUT_BEGIN, p.source.begin, l);
-                    }
-                    p.source.begin = INPUT_BEGIN;
-                    p.source.end = INPUT_BEGIN + l;
-
-                    l = fread(p.source.end, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
-                    if (ferror(input_file)) {
-                        perror(input_filename);
-                        errno = 0;
-                        break;
-                    }
-                    if (l == 0) {
-                        continue;
-                    }
-                    total_bytes_in += l;
-                    p.source.end = p.source.end + l;
-                }
-
-                if (decompress) {
-                    decompress_blocks(&p, false, false);
-                } else {
-                    compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
-                }
-
-                while ((p.destination.end - p.destination.begin) >= BUF_IO_SIZE) {
-                    l = fwrite(p.destination.begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
-                    if (ferror(output_file)) {
-                        perror(output_filename);
-                        exit(EXIT_FAILURE);
-                    }
-                    total_bytes_out += l;
-                    p.destination.begin = p.destination.begin + l;
-                }
-                if (p.destination.begin > OUTPUT_BEGIN) {
-                    l = (size_t)(p.destination.end - p.destination.begin);
-                    if (l > 0) {
-                        memmove(OUTPUT_BEGIN, p.destination.begin, l);
-                    }
-                    p.destination.begin = OUTPUT_BEGIN;
-                    p.destination.end = OUTPUT_BEGIN + l;
-                }
+    while(!feof(input_file)) {
+        l = (size_t)(p.source.end - p.source.begin);
+        if (l <= BUF_GAP_SIZE) {
+            if (l > 0) {
+                memmove(INPUT_BEGIN, p.source.begin, l);
             }
-            if (input_file == stdin) {
-                --number_of_stdin_args;
-                if (number_of_stdin_args <= 0) {
-                    fclose(input_file);
-                } else {
-                    clearerr(input_file);
-                }
-            } else {
-                fclose(input_file);
+            p.source.begin = INPUT_BEGIN;
+            p.source.end = INPUT_BEGIN + l;
+
+            l = fread(p.source.end, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
+            if (ferror(input_file)) {
+                if (verbosity_level >= 0)
+                    perror(input_filename);
+                exit(EXIT_FAILURE);
             }
-        } else {
-            if (!quiet_flag)
-                perror(input_filename);
-            errno = 0;
+            if (l == 0) {
+                continue;
+            }
+            total_bytes_in += l;
+            p.source.end = p.source.end + l;
         }
-        ++optind;
+
+        if (decompress) {
+            decompress_blocks(&p, false, false);
+        } else {
+            compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
+        }
+
+        while ((p.destination.end - p.destination.begin) >= BUF_IO_SIZE) {
+            l = fwrite(p.destination.begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
+            if (ferror(output_file)) {
+                if (verbosity_level >= 0)
+                    perror(output_filename);
+                exit(EXIT_FAILURE);
+            }
+            total_bytes_out += l;
+            p.destination.begin = p.destination.begin + l;
+        }
+        if (p.destination.begin > OUTPUT_BEGIN) {
+            l = (size_t)(p.destination.end - p.destination.begin);
+            if (l > 0) {
+                memmove(OUTPUT_BEGIN, p.destination.begin, l);
+            }
+            p.destination.begin = OUTPUT_BEGIN;
+            p.destination.end = OUTPUT_BEGIN + l;
+        }
     }
+
+    if (input_file != NULL) {
+        fclose(input_file);
+    }
+
     if (p.source.end - p.source.begin > 0) {
         if (decompress) {
             decompress_blocks(&p, true, true);
@@ -678,8 +686,18 @@ int main (int argc, char **argv)
     l = (size_t)(p.destination.end - p.destination.begin);
     if (l > 0) {
         l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
+        if (ferror(output_file)) {
+            if (verbosity_level >= 0)
+                perror(output_filename);
+            exit(EXIT_FAILURE);
+        }
         total_bytes_out += l;
     }
+
+    if (output_file != NULL) {
+        fclose(output_file);
+    }
+
     /* print totals here */
     /* print("<total> :{:>6.1%} ({} => {} bytes, {})".format(ratio, r, w, output_file.file_name), file=sys.stderr) */
 
@@ -701,10 +719,6 @@ int main (int argc, char **argv)
         fputs(output_filename, stderr);
         fputs(" :-99.8% (8192 => 8320 bytes)", stderr);
     }*/
-
-    if (output_file != NULL) {
-        fclose(output_file);
-    }
 
     exit(EXIT_SUCCESS);
 }
