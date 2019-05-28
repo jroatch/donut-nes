@@ -323,6 +323,7 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
     uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
     bool planes_match;
     uint64_t first_non_zero_plane;
+    uint64_t first_non_zero_plane_predict;
     int number_of_pb8_planes;
     int first_pb8_length;
     p = *(result_p);
@@ -352,6 +353,7 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                 planes_match = true;
                 first_pb8_length = 0;
                 first_non_zero_plane = 0;
+                first_non_zero_plane_predict = 0;
                 for (i = 0; i < 8; ++i) {
                     plane = block[i];
                     if (i & 1) {
@@ -371,9 +373,12 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                         temp_p += l;
                         plane_def |= 1;
                         if (number_of_pb8_planes == 0) {
+                            first_non_zero_plane_predict = plane_predict;
                             first_non_zero_plane = plane;
                             first_pb8_length = l;
                         } else if (first_non_zero_plane != plane) {
+                            planes_match = false;
+                        } else if (first_non_zero_plane_predict != plane_predict) {
                             planes_match = false;
                         }
                         ++number_of_pb8_planes;
