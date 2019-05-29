@@ -36,15 +36,13 @@ const char *HELP_TEXT =
    but that's 2 times the size of the entire 6502 address space!
    The usual data input is going to be 512 tiles of NES gfx data. */
 #define BUF_IO_SIZE 8192
-#define BUF_GAP_SIZE 128
-#define BUF_TEMP_SIZE 256
-#define BUF_TOTAL_SIZE ((BUF_IO_SIZE+BUF_GAP_SIZE)*2+BUF_TEMP_SIZE)
+#define BUF_GAP_SIZE 512
+#define BUF_TOTAL_SIZE ((BUF_IO_SIZE+BUF_GAP_SIZE)*2)
 
 static uint8_t byte_buffer[BUF_TOTAL_SIZE];
 
 #define OUTPUT_BEGIN (byte_buffer)
-#define INPUT_BEGIN (byte_buffer + BUF_IO_SIZE + BUF_GAP_SIZE)
-#define TEMP_BEGIN (byte_buffer + BUF_TOTAL_SIZE - BUF_TEMP_SIZE)
+#define INPUT_BEGIN (byte_buffer + BUF_TOTAL_SIZE - BUF_IO_SIZE)
 
 int popcount8(uint8_t x) {
     /* would be nice if I could get this to compile to 1 CPU instruction. */
@@ -54,16 +52,20 @@ int popcount8(uint8_t x) {
     return (int)x;
 }
 
-typedef struct byte_range {
-    uint8_t *begin;    /* first valid byte */
-    uint8_t *end;      /* one past the last valid byte */
-                       /* length is infered as end - begin. */
-} byte_range;
-
 typedef struct buffer_pointers {
-    byte_range source;
-    byte_range destination;
+    uint8_t *dest_begin; /* first valid byte */
+    uint8_t *dest_end;   /* one past the last valid byte */
+                                /* length is infered as end - begin. */
+    uint8_t *src_begin;
+    uint8_t *src_end;
 } buffer_pointers;
+
+enum {
+    DESTINATION_FULL,
+    SOURCE_EMPTY,
+    SOURCE_IS_PARTIAL,
+    ENCOUNTERED_UNDEFINED_BLOCK
+};
 
 uint64_t flip_plane_bits_135(uint64_t plane) {
     uint64_t result = 0;
@@ -193,7 +195,7 @@ bool all_pb8_planes_match(uint8_t *p, int pb8_length, int number_of_pb8_planes) 
     return true;
 }
 
-void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_block) {
+int decompress_blocks(buffer_pointers *result_p, bool allow_partial) {
     buffer_pointers p;
     uint64_t plane;
     uint64_t prev_plane = 0;
@@ -207,42 +209,41 @@ void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_
     bool decode_only_1_pb8_plane;
     uint8_t *single_pb8_plane_ptr;
     p = *(result_p);
-    while (p.source.begin - p.destination.end >= 64) {
-        less_then_74_bytes_left = (p.source.end - p.source.begin < 74);
-        if ((less_then_74_bytes_left) && ((!last_block) || (p.source.end - p.source.begin < 1))) {
-            return;
+    while (p.src_begin - p.dest_end >= 64) {
+        less_then_74_bytes_left = (p.src_end - p.src_begin < 74);
+        if (less_then_74_bytes_left && (p.src_end - p.src_begin < 1)) {
+            return SOURCE_EMPTY;
         }
-        block_header = *(p.source.begin);
-        ++(p.source.begin);
+        block_header = *(p.src_begin);
+        ++(p.src_begin);
         if (block_header >= 0xc0) {
-            *(result_p) = p;
-            continue;
+            return ENCOUNTERED_UNDEFINED_BLOCK;
         }
         if (block_header == 0x2a) {
-            l = p.source.end - p.source.begin;
+            l = p.src_end - p.src_begin;
             if (less_then_74_bytes_left && (l < 64)) {
                 if (!allow_partial)
-                    return;
-                memset(p.destination.end, 0x00, 64);
+                    return SOURCE_IS_PARTIAL;
+                memset(p.dest_end, 0x00, 64);
             } else {
                 l = 64;
             }
-            memmove(p.destination.end, p.source.begin, l);
-            p.source.begin += l;
-            p.destination.end += 64;
+            memmove(p.dest_end, p.src_begin, l);
+            p.src_begin += l;
+            p.dest_end += 64;
         } else {
             single_pb8_plane_ptr = NULL;
             if (block_header & 0x02) {
-                if (less_then_74_bytes_left && (p.source.end - p.source.begin < 1)) {
+                if (less_then_74_bytes_left && (p.src_end - p.src_begin < 1)) {
                     if (!allow_partial)
-                        return;
+                        return SOURCE_IS_PARTIAL;
                     plane_def = 0x00;
                 } else {
-                    plane_def = *(p.source.begin);
-                    ++(p.source.begin);
+                    plane_def = *(p.src_begin);
+                    ++(p.src_begin);
                 }
                 decode_only_1_pb8_plane = ((block_header & 0x04) && (plane_def != 0x00));
-                single_pb8_plane_ptr = p.source.begin;
+                single_pb8_plane_ptr = p.src_begin;
             } else {
                 plane_def = short_defs[(block_header & 0x0c) >> 2];
                 decode_only_1_pb8_plane = false;
@@ -255,28 +256,28 @@ void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_
                 }
                 if (plane_def & 0x80) {
                     if (decode_only_1_pb8_plane) {
-                        p.source.begin = single_pb8_plane_ptr;
+                        p.src_begin = single_pb8_plane_ptr;
                     }
-                    if (less_then_74_bytes_left && (p.source.end - p.source.begin < 1)) {
+                    if (less_then_74_bytes_left && (p.src_end - p.src_begin < 1)) {
                         if (!allow_partial)
-                            return;
+                            return SOURCE_IS_PARTIAL;
                         pb8_flags = 0x00;
                         plane_def = 0x00;
                     } else {
-                        pb8_flags = *(p.source.begin);
-                        ++p.source.begin;
+                        pb8_flags = *(p.src_begin);
+                        ++p.src_begin;
                     }
                     pb8_byte = (uint8_t)plane;
                     for (j = 0; j < 8; ++j) {
                         if (pb8_flags & 0x80) {
-                            if (less_then_74_bytes_left && (p.source.end - p.source.begin < 1)) {
+                            if (less_then_74_bytes_left && (p.src_end - p.src_begin < 1)) {
                                 if (!allow_partial)
-                                    return;
+                                    return SOURCE_IS_PARTIAL;
                                 pb8_flags = 0x00;
                                 plane_def = 0x00;
                             } else {
-                                pb8_byte = *(p.source.begin);
-                                ++p.source.begin;
+                                pb8_byte = *(p.src_begin);
+                                ++p.src_begin;
                             }
                         }
                         pb8_flags <<= 1;
@@ -295,10 +296,10 @@ void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_
                     if (block_header & 0x40) {
                         plane ^= prev_plane;
                     }
-                    write_plane(p.destination.end, prev_plane);
-                    p.destination.end += 8;
-                    write_plane(p.destination.end, plane);
-                    p.destination.end += 8;
+                    write_plane(p.dest_end, prev_plane);
+                    p.dest_end += 8;
+                    write_plane(p.dest_end, plane);
+                    p.dest_end += 8;
                 } else {
                     prev_plane = plane;
                 }
@@ -306,10 +307,10 @@ void decompress_blocks(buffer_pointers *result_p, bool allow_partial, bool last_
         }
         *(result_p) = p;
     }
-    return;
+    return DESTINATION_FULL;
 }
 
-void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_limit){
+int compress_blocks(buffer_pointers *result_p, bool allow_partial, bool use_bit_flip, int cycle_limit){
     buffer_pointers p;
     uint64_t block[8];
     uint64_t plane;
@@ -327,14 +328,24 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
     int number_of_pb8_planes;
     int first_pb8_length;
     p = *(result_p);
-    while ((p.source.end - p.source.begin >= 64) && (p.source.begin - p.destination.end >= 65)) {
-        *(p.destination.end) = 0x2a;
-        memmove(p.destination.end + 1, p.source.begin, 64);
+    while (p.src_begin - p.dest_end >= 65) {
+        l = p.src_end - p.src_begin;
+        if (l <= 0) {
+            return SOURCE_EMPTY;
+        } else if (l < 64) {
+            if (!allow_partial)
+                return SOURCE_IS_PARTIAL;
+            memset(p.dest_end + 1, 0x00, 64);
+        } else {
+            l = 64;
+        }
+        *(p.dest_end) = 0x2a;
+        memmove(p.dest_end + 1, p.src_begin, l);
+        p.src_begin += l;
         shortest_length = 65;
         least_cost = 1269;
         for (i = 0; i < 8; ++i) {
-            block[i] = read_plane(p.source.begin);
-            p.source.begin += 8;
+            block[i] = read_plane((p.dest_end + 1) + (i*8));
         }
         for (r = 0; r < 2; ++r) {
             if (r == 1) {
@@ -412,17 +423,17 @@ void compress_blocks(buffer_pointers *result_p, bool use_bit_flip, int cycle_lim
                 if (l <= shortest_length) {
                     i = cblock_cost(temp_p, l);
                     if ((i <= cycle_limit) && ((l < shortest_length) || (i < least_cost))) {
-                        memmove(p.destination.end, temp_p, l);
+                        memmove(p.dest_end, temp_p, l);
                         shortest_length = l;
                         least_cost = i;
                     }
                 }
             }
         }
-        p.destination.end += shortest_length;
+        p.dest_end += shortest_length;
         *(result_p) = p;
     }
-    return;
+    return DESTINATION_FULL;
 }
 
 int main (int argc, char **argv)
@@ -446,6 +457,8 @@ int main (int argc, char **argv)
     size_t l;
 
     int cycle_limit = 10000;
+
+    int status;
 
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -625,78 +638,78 @@ int main (int argc, char **argv)
         setvbuf(input_file, NULL, _IONBF, 0);
     }
 
-    p.source.begin = INPUT_BEGIN;
-    p.source.end = INPUT_BEGIN;
-    p.destination.begin = OUTPUT_BEGIN;
-    p.destination.end = OUTPUT_BEGIN;
-    while(!feof(input_file)) {
-        l = (size_t)(p.source.end - p.source.begin);
-        if (l <= BUF_GAP_SIZE) {
+    p.src_begin = INPUT_BEGIN;
+    p.src_end = INPUT_BEGIN;
+    p.dest_begin = OUTPUT_BEGIN;
+    p.dest_end = OUTPUT_BEGIN;
+    status = SOURCE_EMPTY;
+    while(true) {
+        l = (size_t)(p.src_end - p.src_begin);
+        if ((l <= BUF_GAP_SIZE) && !feof(input_file)) {
             if (l > 0) {
-                memmove(INPUT_BEGIN, p.source.begin, l);
+                memmove(INPUT_BEGIN - l, p.src_begin, l);
             }
-            p.source.begin = INPUT_BEGIN;
-            p.source.end = INPUT_BEGIN + l;
+            p.src_begin = INPUT_BEGIN - l;
+            p.src_end = INPUT_BEGIN;
 
-            l = fread(p.source.end, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
+            l = fread(INPUT_BEGIN, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
             if (ferror(input_file)) {
                 if (verbosity_level >= 0)
                     perror(input_filename);
                 exit(EXIT_FAILURE);
             }
-            if (l == 0) {
-                continue;
-            }
+            p.src_end += l;
             total_bytes_in += l;
-            p.source.end = p.source.end + l;
         }
 
         if (decompress) {
-            decompress_blocks(&p, false, false);
+            status = decompress_blocks(&p, feof(input_file));
         } else {
-            compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
+            status = compress_blocks(&p, feof(input_file), !no_bit_flip_blocks, cycle_limit);
         }
 
-        while ((p.destination.end - p.destination.begin) >= BUF_IO_SIZE) {
-            l = fwrite(p.destination.begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
+        l = (size_t)(p.dest_end - p.dest_begin);
+        if (l >= BUF_IO_SIZE) {
+            l = fwrite(p.dest_begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
             if (ferror(output_file)) {
                 if (verbosity_level >= 0)
                     perror(output_filename);
                 exit(EXIT_FAILURE);
             }
+            p.dest_begin += l;
             total_bytes_out += l;
-            p.destination.begin = p.destination.begin + l;
-        }
-        if (p.destination.begin > OUTPUT_BEGIN) {
-            l = (size_t)(p.destination.end - p.destination.begin);
+
+            l = (size_t)(p.dest_end - p.dest_begin);
             if (l > 0) {
-                memmove(OUTPUT_BEGIN, p.destination.begin, l);
+                memmove(OUTPUT_BEGIN, p.dest_begin, l);
             }
-            p.destination.begin = OUTPUT_BEGIN;
-            p.destination.end = OUTPUT_BEGIN + l;
+            p.dest_begin = OUTPUT_BEGIN;
+            p.dest_end = OUTPUT_BEGIN + l;
+        }
+
+        if ((feof(input_file) && (status == SOURCE_EMPTY)) || (status == ENCOUNTERED_UNDEFINED_BLOCK)) {
+            l = (size_t)(p.dest_end - p.dest_begin);
+            if (l > 0) {
+                l = fwrite(p.dest_begin, sizeof(uint8_t), (size_t)l, output_file);
+                if (ferror(output_file)) {
+                    if (verbosity_level >= 0)
+                        perror(output_filename);
+                    exit(EXIT_FAILURE);
+                }
+                p.dest_begin += l;
+                total_bytes_out += l;
+            }
+            if (status == ENCOUNTERED_UNDEFINED_BLOCK) {
+                if (verbosity_level >= 0)
+                    fputs("Error: Unhandled block header >= 0xc0.\n", stderr);
+                exit(EXIT_FAILURE);
+            }
+            break;
         }
     }
 
     if (input_file != NULL) {
         fclose(input_file);
-    }
-
-    if (p.source.end - p.source.begin > 0) {
-        if (decompress) {
-            decompress_blocks(&p, true, true);
-        } else {
-            compress_blocks(&p, !no_bit_flip_blocks, cycle_limit);
-        }
-    }
-    l = (size_t)(p.destination.end - p.destination.begin);
-    if (l > 0) {
-        l = fwrite(p.destination.begin, sizeof(uint8_t), l, output_file);
-        if (ferror(output_file)) {
-            if (verbosity_level >= 0)
-                perror(output_filename);
-            exit(EXIT_FAILURE);
-        }
-        total_bytes_out += l;
     }
 
     if (output_file != NULL) {
