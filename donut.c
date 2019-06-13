@@ -28,7 +28,7 @@ const char *HELP_TEXT =
     "  -q, --quiet            suppress error messages\n"
     "  --no-bit-flip          don't encode bit rotated blocks\n"
     "  --cycle-limit INT      limits the 6502 decoding time for each encoded block,\n"
-    "                         must be at least 1269\n"
+    "                         must be at least 1266\n"
 ;
 
 /* According to a strace of cat on my system, and a quick dd of dev/zero:
@@ -145,10 +145,10 @@ int cblock_cost(uint8_t *p, int l) {
     if (block_header >= 0xc0)
         return 0;
     if (block_header == 0x2a)
-        return 1269;
-    cycles = 1281;
+        return 1266;
+    cycles = 1300;
     if (block_header & 0xc0)
-        cycles += 640;
+        cycles += 638;
     if (block_header & 0x20)
         cycles += 4;
     if (block_header & 0x10)
@@ -343,7 +343,7 @@ int compress_blocks(buffer_pointers *result_p, bool allow_partial, bool use_bit_
         memmove(p.dest_end + 1, p.src_begin, l);
         p.src_begin += l;
         shortest_length = 65;
-        least_cost = 1269;
+        least_cost = 1266;
         for (i = 0; i < 8; ++i) {
             block[i] = read_plane((p.dest_end + 1) + (i*8));
         }
@@ -526,8 +526,8 @@ int main (int argc, char **argv)
 
         break; case 'y'+256:
             cycle_limit = strtol(optarg, NULL, 0);
-            if (cycle_limit < 1269) {
-                fputs("Invalid parameter for --cycle-limit. Must be a integer >= 1269.\n", stderr);
+            if (cycle_limit < 1266) {
+                fputs("Invalid parameter for --cycle-limit. Must be a integer >= 1266.\n", stderr);
                 exit(EXIT_FAILURE);
             }
 
