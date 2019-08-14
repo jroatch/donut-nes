@@ -32,6 +32,21 @@ const char *HELP_TEXT =
 	"                         must be at least 1268\n"
 ;
 
+static int verbosity_level = 0;
+static void fatal_error(const char *msg)
+{
+	if (verbosity_level >= 0)
+		fputs(msg, stderr);
+	exit(EXIT_FAILURE);
+}
+
+static void fatal_perror(const char *filename)
+{
+	if (verbosity_level >= 0)
+		perror(filename);
+	exit(EXIT_FAILURE);
+}
+
 /* According to a strace of cat on my system, and a quick dd of dev/zero:
    131072 is the optimal block size,
    but that's 2 times the size of the entire 6502 address space!
@@ -449,10 +464,200 @@ int compress_blocks(buffer_pointers *result_p, bool allow_partial, bool use_bit_
 	return DESTINATION_FULL;
 }
 
+uint64_t fill_dont_care_bits(uint64_t plane, uint64_t dont_care_mask, uint64_t xor_bg, uint8_t top_value) {
+	uint64_t result_plane = 0;
+	uint64_t backwards_smudge_plane = 0;
+	uint64_t current_byte, mask, inv_mask;
+	int i;
+	if (dont_care_mask == 0x0000000000000000)
+		return plane;
+
+	current_byte = top_value;
+	for (i = 0; i < 8; ++i) {
+		mask = dont_care_mask & ((uint64_t)0xff << (i*8));
+		inv_mask = ~dont_care_mask & ((uint64_t)0xff << (i*8));
+		current_byte = (current_byte & mask) | (plane & inv_mask);
+		backwards_smudge_plane |= current_byte;
+		current_byte = current_byte << 8;
+	}
+	backwards_smudge_plane ^= xor_bg & dont_care_mask;
+
+	current_byte = (uint64_t)top_value << 56;
+	for (i = 0; i < 8; ++i) {
+		mask = dont_care_mask & ((uint64_t)0xff << (8*(7-i)));
+		inv_mask = ~dont_care_mask & ((uint64_t)0xff << (8*(7-i)));
+		if ((plane & inv_mask) == (current_byte & inv_mask)) {
+			current_byte = (current_byte & mask) | (plane & inv_mask);
+		} else {
+			current_byte = (backwards_smudge_plane & mask) | (plane & inv_mask);
+		}
+		result_plane |= current_byte;
+		current_byte = current_byte >> 8;
+	}
+
+	return result_plane;
+}
+
+/*  most of this copied pasted from compress_blocks,
+    but with fill_dont_care_bits sprinkled throughout */
+int compress_blocks_with_dcb(buffer_pointers *result_p, bool allow_partial, bool use_bit_flip, int cycle_limit)
+{
+	buffer_pointers p;
+	uint64_t original_block[8];
+	uint64_t block[8];
+	uint64_t mask[8];
+	uint64_t plane;
+	uint64_t plane_predict;
+	uint64_t plane_predict_l;
+	uint64_t plane_predict_m;
+	int shortest_length;
+	int least_cost;
+	int a, i, r, l;
+	uint8_t temp_cblock[74];
+	uint8_t *temp_p;
+	uint8_t plane_def;
+	uint8_t short_defs[4] = {0x00, 0x55, 0xaa, 0xff};
+	bool planes_match;
+	uint64_t first_non_zero_plane;
+	uint64_t first_non_zero_plane_predict;
+	int number_of_pb8_planes;
+	int first_pb8_length;
+	p = *(result_p);
+	while (p.src_begin - p.dest_end >= 65) {
+		l = p.src_end - p.src_begin;
+		if (l <= 0) {
+			return SOURCE_EMPTY;
+		} else if (l < 128) {
+			if (!allow_partial)
+				return SOURCE_IS_PARTIAL;
+			memset(p.dest_end + 1, 0x00, 64);
+		} else {
+			l = 64;
+		}
+		*(p.dest_end) = 0x2a;
+		memmove(p.dest_end + 1, p.src_begin, l);
+		p.src_begin += l;
+		shortest_length = 65;
+		least_cost = 1268;
+		for (i = 0; i < 8; ++i) {
+			original_block[i] = read_plane((p.dest_end + 1) + (i*8));
+		}
+		if (p.src_end - p.src_begin > 0){
+			for (i = 0; i < 8; ++i) {
+				mask[i] = read_plane((p.src_begin) + (i*8));
+			}
+			p.src_begin += 64;
+		} else {
+			for (i = 0; i < 8; ++i) {
+				mask[i] = 0;
+			}
+		}
+		for (r = 0; r < 2; ++r) {
+			if (r == 1) {
+				if (use_bit_flip) {
+					for (i = 0; i < 8; ++i) {
+						original_block[i] = flip_plane_bits_135(original_block[i]);
+					}
+					for (i = 0; i < 8; ++i) {
+						mask[i] = flip_plane_bits_135(mask[i]);
+					}
+				} else {
+					break;
+				}
+			}
+			for (a = 0; a < 0xc; ++a) {
+				for (i = 0; i < 8; i += 2) {
+					plane_predict_l = (a & 0x2) ? 0xffffffffffffffff : 0x0000000000000000;
+					block[i+0] = fill_dont_care_bits(original_block[i+0], mask[i+0], 0, plane_predict_l);
+					plane_predict_m = (a & 0x1) ? 0xffffffffffffffff : 0x0000000000000000;
+					block[i+1] = fill_dont_care_bits(original_block[i+1], mask[i+1], 0, plane_predict_m);
+
+					if (a & 0x8)
+						block[i+0] = fill_dont_care_bits(block[i+0], mask[i+0], block[i+1], plane_predict_l);
+					if (a & 0x4)
+						block[i+1] = fill_dont_care_bits(block[i+1], mask[i+1], block[i+0], plane_predict_m);
+				}
+				temp_p = temp_cblock + 2;
+				plane_def = 0x00;
+				number_of_pb8_planes = 0;
+				planes_match = true;
+				first_pb8_length = 0;
+				first_non_zero_plane = 0;
+				first_non_zero_plane_predict = 0;
+				for (i = 0; i < 8; ++i) {
+					plane = block[i];
+					if (i & 1) {
+						plane_predict = (a & 0x1) ? 0xffffffffffffffff : 0x0000000000000000;
+						if (a & 0x4) {
+							plane ^= block[i-1];
+						}
+					} else {
+						plane_predict = (a & 0x2) ? 0xffffffffffffffff : 0x0000000000000000;
+						if (a & 0x8) {
+							plane ^= block[i+1];
+						}
+					}
+					plane_def <<= 1;
+					if (plane != plane_predict) {
+						l = pack_pb8(temp_p, plane, (uint8_t)plane_predict);
+						temp_p += l;
+						plane_def |= 1;
+						if (number_of_pb8_planes == 0) {
+							first_non_zero_plane_predict = plane_predict;
+							first_non_zero_plane = plane;
+							first_pb8_length = l;
+						} else if (first_non_zero_plane != plane) {
+							planes_match = false;
+						} else if (first_non_zero_plane_predict != plane_predict) {
+							planes_match = false;
+						}
+						++number_of_pb8_planes;
+					}
+				}
+				if (number_of_pb8_planes <= 1) {
+					planes_match = false;
+					/* a normal block of 1 plane is cheaper to decode,
+					   and may even be smaller. */
+				}
+				temp_cblock[0] = r | (a<<4) | 0x02;
+				temp_cblock[1] = plane_def;
+				l = temp_p - temp_cblock;
+				temp_p = temp_cblock;
+				if (all_pb8_planes_match(temp_p+2, first_pb8_length, number_of_pb8_planes)) {
+					*(temp_p + 0) = r | (a<<4) | 0x06;
+					l = 2 + first_pb8_length;
+				} else if (planes_match) {
+					*(temp_p + 0) = r | (a<<4) | 0x06;
+					l = 2 + pack_pb8(temp_p+2, first_non_zero_plane, ~(uint8_t)first_non_zero_plane);
+				} else {
+					for (i = 0; i < 4; ++i) {
+						if (plane_def == short_defs[i]) {
+							++temp_p;
+							*(temp_p + 0) = r | (a<<4) | (i << 2);
+							--l;
+							break;
+						}
+					}
+				}
+				if (l <= shortest_length) {
+					i = cblock_cost(temp_p, l);
+					if ((i <= cycle_limit) && ((l < shortest_length) || (i < least_cost))) {
+						memmove(p.dest_end, temp_p, l);
+						shortest_length = l;
+						least_cost = i;
+					}
+				}
+			}
+		}
+		p.dest_end += shortest_length;
+		*(result_p) = p;
+	}
+	return DESTINATION_FULL;
+}
+
 int main (int argc, char **argv)
 {
 	int c;
-	int verbosity_level = 0;
 	char *input_filename = NULL;
 	char *output_filename = NULL;
 	FILE *input_file = NULL;
@@ -461,6 +666,7 @@ int main (int argc, char **argv)
 	bool force_overwrite = false;
 	bool use_stdio_for_data = false;
 	bool no_bit_flip_blocks = false;
+	bool interleaved_dont_care_bits = false;
 
 	int total_bytes_in = 0;
 	int total_bytes_out = 0;
@@ -490,6 +696,7 @@ int main (int argc, char **argv)
 			{"quiet",       no_argument,       NULL, 'q'},
 			{"no-bit-flip", no_argument,       NULL, 'b'+256},
 			{"cycle-limit", required_argument, NULL, 'y'+256},
+			{"interleaved-dont-care-bits", no_argument, NULL, 'd'+256},
 			{NULL, 0, NULL, 0}
 		};
 		/* getopt_long stores the option index here. */
@@ -539,10 +746,9 @@ int main (int argc, char **argv)
 
 		break; case 'y'+256:
 			cycle_limit = strtol(optarg, NULL, 0);
-			if (cycle_limit < 1268) {
-				fputs("Invalid parameter for --cycle-limit. Must be a integer >= 1268.\n", stderr);
-				exit(EXIT_FAILURE);
-			}
+
+		break; case 'd'+256:
+			interleaved_dont_care_bits = true;
 
 		break; case '?':
 			/* getopt_long already printed an error message. */
@@ -557,6 +763,10 @@ int main (int argc, char **argv)
 		fclose(stderr);
 	}
 
+	if (cycle_limit < 1268) {
+		fatal_error("Invalid parameter for --cycle-limit. Must be a integer >= 1268.\n");
+	}
+
 	if ((input_filename == NULL) && (optind < argc)) {
 		input_filename = argv[optind];
 		++optind;
@@ -568,18 +778,14 @@ int main (int argc, char **argv)
 	}
 
 	if ((input_filename == NULL) && (output_filename == NULL) && (!use_stdio_for_data)) {
-		if (verbosity_level >= 0)
-			fputs("Input and output filenames required. Try --help for more info.\n", stderr);
-		exit(EXIT_FAILURE);
+		fatal_error("Input and output filenames required. Try --help for more info.\n");
 	}
 
 	if (input_filename == NULL) {
 		if (use_stdio_for_data) {
 			input_file = stdin;
 		} else {
-			if (verbosity_level >= 0)
-				fputs("input filename required. Try --help for more info.\n", stderr);
-			exit(EXIT_FAILURE);
+			fatal_error("input filename required. Try --help for more info.\n");
 		}
 	}
 
@@ -587,9 +793,7 @@ int main (int argc, char **argv)
 		if (use_stdio_for_data) {
 			output_file = stdout;
 		} else {
-			if (verbosity_level >= 0)
-				fputs("output filename required. Try --help for more info.\n", stderr);
-			exit(EXIT_FAILURE);
+			fatal_error("output filename required. Try --help for more info.\n");
 		}
 	}
 
@@ -629,9 +833,7 @@ int main (int argc, char **argv)
 			errno = 0;
 			output_file = fopen(output_filename, "wb");
 			if (output_file == NULL) {
-				if (verbosity_level >= 0)
-					perror(output_filename);
-				exit(EXIT_FAILURE);
+				fatal_perror(output_filename);
 			}
 			setvbuf(output_file, NULL, _IONBF, 0);
 		} else {
@@ -646,9 +848,7 @@ int main (int argc, char **argv)
 		fclose(stdin);
 		input_file = fopen(input_filename, "rb");
 		if (input_file == NULL) {
-			if (verbosity_level >= 0)
-				perror(input_filename);
-			exit(EXIT_FAILURE);
+			fatal_perror(input_filename);
 		}
 		setvbuf(input_file, NULL, _IONBF, 0);
 	} else {
@@ -671,9 +871,7 @@ int main (int argc, char **argv)
 
 			l = fread(INPUT_BEGIN, sizeof(uint8_t), (size_t)BUF_IO_SIZE, input_file);
 			if (ferror(input_file)) {
-				if (verbosity_level >= 0)
-					perror(input_filename);
-				exit(EXIT_FAILURE);
+				fatal_perror(input_filename);
 			}
 			p.src_end += l;
 			total_bytes_in += l;
@@ -681,6 +879,8 @@ int main (int argc, char **argv)
 
 		if (decompress) {
 			status = decompress_blocks(&p, feof(input_file));
+		} else if (interleaved_dont_care_bits) {
+			status = compress_blocks_with_dcb(&p, feof(input_file), !no_bit_flip_blocks, cycle_limit);
 		} else {
 			status = compress_blocks(&p, feof(input_file), !no_bit_flip_blocks, cycle_limit);
 		}
@@ -689,9 +889,7 @@ int main (int argc, char **argv)
 		if (l >= BUF_IO_SIZE) {
 			l = fwrite(p.dest_begin, sizeof(uint8_t), (size_t)BUF_IO_SIZE, output_file);
 			if (ferror(output_file)) {
-				if (verbosity_level >= 0)
-					perror(output_filename);
-				exit(EXIT_FAILURE);
+				fatal_perror(output_filename);
 			}
 			p.dest_begin += l;
 			total_bytes_out += l;
@@ -709,17 +907,13 @@ int main (int argc, char **argv)
 			if (l > 0) {
 				l = fwrite(p.dest_begin, sizeof(uint8_t), (size_t)l, output_file);
 				if (ferror(output_file)) {
-					if (verbosity_level >= 0)
-						perror(output_filename);
-					exit(EXIT_FAILURE);
+					fatal_error(output_filename);
 				}
 				p.dest_begin += l;
 				total_bytes_out += l;
 			}
 			if (status == ENCOUNTERED_UNDEFINED_BLOCK) {
-				if (verbosity_level >= 0)
-					fputs("Error: Unhandled block header >= 0xc0.\n", stderr);
-				exit(EXIT_FAILURE);
+				fatal_error("Error: Unhandled block header >= 0xc0.\n");
 			}
 			break;
 		}
