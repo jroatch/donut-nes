@@ -7,6 +7,8 @@
 ; code copies.  This file is offered as-is, without any warranty.
 ;
 ; Version History:
+; 2019-10-23: Slight API change to decompress_block. It returns
+;             bytes read in Y instead of adding that to stream_ptr.
 ; 2019-02-15: Swapped the M and L bits, for conceptual consistency.
 ;             Also rearranged branches for speed.
 ; 2019-02-07: Removed "Duplicate" block type, and moved
@@ -19,26 +21,64 @@
 ; 2018-04-30: Initial release.
 ;
 
-.export donut_decompress_block, donut_block_ayx, donut_block_x
+.export donut_decompress_block, donut_bulk_load_ayx, donut_bulk_load_x
 .export donut_block_buffer
 .exportzp donut_stream_ptr
-.exportzp donut_block_count
 
-temp = $00  ; 15 bytes are used
+temp = $00  ; 16 bytes are used
 
 donut_block_buffer = $0100  ; 64 bytes
 
 .segment "ZEROPAGE"
 donut_stream_ptr:       .res 2
-donut_block_count:      .res 1
 
 .segment "CODE"
+;;
+; Decompress X*64 bytes starting at AAYY to the NES PPU via $2007 PPU_DATA
+; Assumes The PPU is in forced blank, and $2006 is loaded with the desired address
+;
+; Trashes A, X, Y, temp 0 ~ temp 16.
+.proc donut_bulk_load_ayx
+  sty donut_stream_ptr+0
+  sta donut_stream_ptr+1
+;,; jmp donut_bulk_load
+.endproc
+.proc donut_bulk_load_x
+PPU_DATA = $2007
+block_count = temp+15
+  stx block_count
+  block_loop:
+    ldx #64
+    jsr donut_decompress_block
+    bcs end_block_upload  ; bail on error.
+    ldx #64
+    upload_loop:
+      lda donut_block_buffer, x
+      sta PPU_DATA
+      inx
+    bpl upload_loop
+    tya
+    ;,; clc
+    adc donut_stream_ptr+0
+    sta donut_stream_ptr+0
+    bcc add_stream_ptr_no_inc_high_byte
+      inc donut_stream_ptr+1
+    add_stream_ptr_no_inc_high_byte:
+    dec block_count
+  bne block_loop
+end_block_upload:
+rts
+.endproc
 
 ;;
+; donut_decompress_block
+;
 ; Decompresses a single variable sized block pointed to by donut_stream_ptr
 ; Outputing 64 bytes to donut_block_buffer offsetted by the X register.
-; On success, 64 will be added to the X register, donut_block_count
-; will be decremented, and Y will contain the number of bytes read.
+;
+; Carry flag is cleared on success and set on failure.
+; The returned Y register is the number of input bytes read. (0 on failure)
+; and 64 will be added to the X register. (unchanged on failure)
 ;
 ; Block header:
 ; LMlmbbBR
@@ -65,8 +105,9 @@ donut_block_count:      .res 1
 ; X >= 192: Also returns in Error, the buffer would of unexpectedly page warp.
 ;
 ; Trashes A, temp 0 ~ temp 15.
-; bytes: 255, cycles: 1269 ~ 7238.
-.proc donut_decompress_block
+; bytes: 242, average cycles: 3700, cycle range: 1258 ~ 7225.
+.scope donut
+; The subroutine name is donut_decompress_block
 plane_buffer        = temp+0 ; 8 bytes
 pb8_ctrl            = temp+8
 temp_y              = pb8_ctrl
@@ -76,42 +117,11 @@ plane_def           = temp+11
 block_offset_end    = temp+12
 block_header        = temp+13
 is_rotated          = temp+14
-;_donut_unused_temp  = temp+15
-  ldy #$00
-  txa
-  clc
-  adc #64
-  bcs exit_error
-  sta block_offset_end
+;_donut_unused_temp  = temp+15  ; Used as block_count in donut_bulk_load
 
-  lda (donut_stream_ptr), y
-  iny  ; Reading input bytes are now post-increment.
-  sta block_header
-
-  cmp #$2a
-  beq do_raw_block
-  ;,; bne do_normal_block
-do_normal_block:
-  cmp #$c0
-  bcc continue_normal_block
-  ;,; bcs exit_error
-exit_error:
-rts
-; If we don't exit here, xor_l_onto_m can underflow into zeropage.
-
-; I'm inserting these things here instead of above the donut_decompress_block
-; at the cost of 1 cycle with the continue_normal_block branch for these reasons:
-; The start of the main routine remains at the start of the .proc scope
-; and I can save 1 byte with 'bcs end_block'
-
-read_plane_def_from_stream:
-  ror
-  lda (donut_stream_ptr), y
-  iny
-bne plane_def_ready  ;,; jmp plane_def_ready
-
+; these 2 routines (do_raw_block and read_plane_def_from_stream)
+; are placed above decompress_block due to branch distance
 do_raw_block:
-  ;,; ldx block_offset
   raw_block_loop:
     lda (donut_stream_ptr), y
     iny
@@ -119,9 +129,36 @@ do_raw_block:
     inx
     cpy #65  ; size of a raw block
   bcc raw_block_loop
-bcs end_block  ;,; jmp end_block
+  clc  ; to indicate success
+exit_error:
+rts
 
-continue_normal_block:
+read_plane_def_from_stream:
+  ror
+  lda (donut_stream_ptr), y
+  iny
+bne plane_def_ready  ;,; jmp plane_def_ready
+
+decompress_block:
+  ldy #$00
+  txa
+  clc
+  adc #64
+  bcs exit_error
+    ; If we don't exit here, xor_l_onto_m can underflow into the previous page.
+  sta block_offset_end
+
+  lda (donut_stream_ptr), y
+  cmp #$c0
+  bcs exit_error
+    ; Return to caller to let it do the processing of headers >= 0xc0.
+  iny  ; Y represents the number of successfully processed bytes.
+
+  cmp #$2a
+  beq do_raw_block
+  ;,; bne do_normal_block
+do_normal_block:
+  sta block_header
   stx block_offset
 
   ;,; lda block_header
@@ -227,17 +264,8 @@ continue_normal_block:
     cmp block_offset_end
   bcc plane_loop
   ldy temp_y
-end_block:
-  ;,; sec
-  clc
-  tya
-  adc donut_stream_ptr+0
-  sta donut_stream_ptr+0
-  bcc add_stream_ptr_no_inc_high_byte
-    inc donut_stream_ptr+1
-  add_stream_ptr_no_inc_high_byte:
-  ldx block_offset_end
-  dec donut_block_count
+  tax  ;,; ldx block_offset_end
+  clc  ; to indicate success
 rts
 
 do_zero_plane:
@@ -289,35 +317,6 @@ beq end_plane  ;,; jmp end_plane
 
 shorthand_plane_def_table:
   .byte $00, $55, $aa, $ff
-.endproc
+.endscope
 
-;;
-; helper subroutine for passing parameters with registers
-; decompress X*64 bytes starting at AAYY to PPU_DATA
-.proc donut_block_ayx
-  sty donut_stream_ptr+0
-  sta donut_stream_ptr+1
-;,; jmp donut_block_x
-.endproc
-.proc donut_block_x
-PPU_DATA = $2007
-  stx donut_block_count
-  block_loop:
-    ldx #64
-    jsr donut_decompress_block
-    cpx #128
-    bne end_block_upload
-      ; bail if donut_decompress_block does not
-      ; advance X by 64 bytes, indicating a header error.
-
-    ldx #64
-    upload_loop:
-      lda donut_block_buffer, x
-      sta PPU_DATA
-      inx
-    bpl upload_loop
-    ldx donut_block_count
-  bne block_loop
-end_block_upload:
-rts
-.endproc
+donut_decompress_block = donut::decompress_block
