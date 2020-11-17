@@ -5,10 +5,56 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// This compression codec is designed for the native texture data of a
+// Nintendo Entertainment System (NES) which can be briefly described as
+// 8x8 2bpp planer formated tiles. Each NES tile uses 16 bytes of data
+// and are often arranged together with similar characteristics such as
+// sharing a particular color. A fixed decoded block size of 64 bytes
+// was chosen for several reasons:
+// - It fits 4 tiles NES tiles which is often but together in a "metatile"
+// - it's the size of 2 rows of tilemap indexes, and the attribute table
+// - less then 256 bytes, beyond which would complicate 6502 addressing modes
+// - it's 8^3 bits, or 8 planes of 8x8 1bpp tiles
+//
+// The compressed block is a variable sized block with most of the key
+// processing info in the first 1 or 2 bytes:
+//     LMlmbbBR
+//     |||||||+-- Rotate plane bits (135° reflection)
+//     ||||000--- All planes: 0x00
+//     ||||010--- L planes: 0x00, M planes:  pb8
+//     ||||100--- L planes:  pb8, M planes: 0x00
+//     ||||110--- All planes: pb8
+//     ||||001--- In another header byte, For each bit starting from MSB
+//     ||||         0: 0x00 plane
+//     ||||         1: pb8 plane
+//     ||||011--- In another header byte, Decode only 1 pb8 plane and
+//     ||||       duplicate it for each bit starting from MSB
+//     ||||         0: 0x00 plane
+//     ||||         1: duplicated plane
+//     ||||       If extra header byte = 0x00, no pb8 plane is decoded.
+//     ||||1x1x-- Reserved for Uncompressed block bit pattern
+//     |||+------ M planes predict from 0xff
+//     ||+------- L planes predict from 0xff
+//     |+-------- M = M XOR L
+//     +--------- L = M XOR L
+//     00101010-- Uncompressed block of 64 bytes (bit pattern is ascii '*' )
+//     11-------- Future extensions.
+//
+// A "pb8 plane" consists of a 8-bit header where each bit indicates
+// duplicating the previous byte or reading a literal byte.
+
+
+// Decompress a series of blocks from the buffer 'src' with the size 'src_length'
+// into an already allocated buffer 'dst' of size 'dst_capacity'.
+// Returns: the number of bytes written to 'dst'.
+// src_bytes_read: if not NULL, it's written with the total number of bytes read.
 int donut_decompress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src_length, int* src_bytes_read);
 
+// Like donut_decompress(), in reverse.
 int donut_compress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src_length, int* src_bytes_read);
 
+// When compressing, the source can expand to a maximum ratio of 65:64.
+// use this to figure how large you should make the 'dst' buffer.
 #define donut_compress_bound(x) ((((x) + 63) / 64) * 65)
 
 int donut_unpack_block(uint8_t* dst, const uint8_t* src);
@@ -137,6 +183,10 @@ int donut_unpack_block(uint8_t* dst, const uint8_t* src)
 	const uint8_t* p = src;
 	uint8_t block_header = *p;
 	++p;
+	if (block_header == 0x00) {
+		memset(dst, 0x00, 64);
+		return 1;
+	}
 	if (block_header >= 0xc0)
 		return 0;
 	if (block_header == 0x2a) {
@@ -303,19 +353,19 @@ static bool donut_nes_all_pb8_planes_match(const uint8_t* buf, int len, int pb8_
 
 int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint8_t* mask)
 {
-	uint64_t planes[16];
+	uint64_t planes[(mask) ? 16 : 8];
 	uint8_t cblock[74];
 	int i;
 
 	// if no limit specified, then basically unlimited.
 	cpu_limit = (cpu_limit) ? cpu_limit : 16384;
 
-	// first the fallback uncompressed block.
+	// first load the fallback uncompressed block.
 	dst[0] = 0x2a;
 	memcpy(dst + 1, src, 64);
 	int shortest_len = 65;
 	int least_cost = 1268;
-	// cpu_limit constrains too much. uncompressed block is all that can happen.
+	// if cpu_limit constrains too much, uncompressed block is all that can happen.
 	if (cpu_limit < 1298)
 		return shortest_len;
 	for (i = 0; i < 8; ++i) {
@@ -379,7 +429,7 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 			cycles += pb8_count;
 		} else {
 			for (i = 0; i < 4*8; i += 8) {
-				if (plane_def == (0xffaa5500 >> i)) {
+				if (plane_def == ((0xffaa5500 >> i) & 0xff)) {
 					++temp_p;
 					temp_p[0] = a | (i >> 1);
 					--len;
