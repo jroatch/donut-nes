@@ -183,7 +183,10 @@ int donut_unpack_block(uint8_t* dst, const uint8_t* src)
 	const uint8_t* p = src;
 	uint8_t block_header = *p;
 	++p;
-	if (block_header == 0x00) {
+	if ((block_header & 0x3e) == 0x00) {
+		// if b2 and b3 == 0, then no mater the combination of
+		// b0 (rotation), b6 (XOR), or b7 (XOR) the result will
+		// always be 64 bytes of \x00
 		memset(dst, 0x00, 64);
 		return 1;
 	}
@@ -465,7 +468,7 @@ int donut_decompress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src
 	while (1) {
 		int src_bytes_remain = src_length - bytes_read;
 		int dst_bytes_remain = dst_capacity - dst_length;
-		if (src_bytes_remain < 0)
+		if (src_bytes_remain <= 0)
 			break;
 		if (dst_bytes_remain < 64)
 			break;
@@ -504,7 +507,7 @@ int donut_compress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src_l
 		int dst_bytes_remain = dst_capacity - dst_length;
 		if (src_bytes_remain < 64)
 			break;
-		if (dst_bytes_remain < 0)
+		if (dst_bytes_remain <= 0)
 			break;
 		if (dst_bytes_remain < 65) {
 			memset(scratch_space, 0x00, 65+64);

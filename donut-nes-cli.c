@@ -260,7 +260,6 @@ int main (int argc, char **argv)
 	while(1) {
 		if (input_buffer_length < BUF_GAP_SIZE) {
 			l = fread(input_buffer + input_buffer_length, sizeof(uint8_t), BUF_IO_SIZE, input_file);
-			total_bytes_in += l;
 			if (ferror(input_file)) {
 				fatal_perror(input_filename);
 			}
@@ -272,6 +271,8 @@ int main (int argc, char **argv)
 		} else {
 			l = donut_compress(output_buffer + output_buffer_length, BUF_IO_SIZE+BUF_GAP_SIZE - output_buffer_length, input_buffer, input_buffer_length, &i);
 		}
+		total_bytes_in += i;
+		total_bytes_out += l;
 		output_buffer_length += l;
 		if ((l == 0) && (i == 0))
 			done = true;
@@ -283,7 +284,6 @@ int main (int argc, char **argv)
 
 		if (output_buffer_length >= BUF_IO_SIZE) {
 			l = fwrite(output_buffer, sizeof(uint8_t), BUF_IO_SIZE, output_file);
-			total_bytes_out += l;
 			if (ferror(output_file)) {
 				fatal_perror(output_filename);
 			}
@@ -296,7 +296,6 @@ int main (int argc, char **argv)
 		if (feof(input_file) || done) {
 			if (output_buffer_length) {
 				l = fwrite(output_buffer, sizeof(uint8_t), output_buffer_length, output_file);
-				total_bytes_out += l;
 				if (ferror(output_file)) {
 					fatal_error(output_filename);
 				}
@@ -311,6 +310,10 @@ int main (int argc, char **argv)
 
 	if (output_file != NULL) {
 		fclose(output_file);
+	}
+
+	if ((verbosity_level >= 0) && (input_buffer_length)) {
+		fprintf (stderr, "%s : %d bytes was not processed!\n", output_filename, input_buffer_length);
 	}
 
 	if (verbosity_level >= 1) {
