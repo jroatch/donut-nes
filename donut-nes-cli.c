@@ -258,7 +258,7 @@ int main (int argc, char **argv)
 
 	bool done = false;
 	while(1) {
-		if (input_buffer_length < BUF_GAP_SIZE) {
+		if (!feof(input_file) && (input_buffer_length < BUF_GAP_SIZE)) {
 			l = fread(input_buffer + input_buffer_length, sizeof(uint8_t), BUF_IO_SIZE, input_file);
 			if (ferror(input_file)) {
 				fatal_perror(input_filename);
@@ -293,13 +293,14 @@ int main (int argc, char **argv)
 			output_buffer_length -= l;
 		}
 
-		if (feof(input_file) || done) {
+		if (done) {
 			if (output_buffer_length) {
 				l = fwrite(output_buffer, sizeof(uint8_t), output_buffer_length, output_file);
 				if (ferror(output_file)) {
 					fatal_error(output_filename);
 				}
 			}
+			output_buffer_length -= l;
 			break;
 		}
 	}

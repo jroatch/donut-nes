@@ -131,32 +131,6 @@ int donut_pack_pb8(uint8_t* dst, uint64_t src, uint8_t top_value)
 	return p - dst;
 }
 
-/*static int donut_unpack_pb8_greedy_read(uint64_t* dst, const uint8_t* src, uint8_t top_value)
-{
-	uint8_t pb8_byte = top_value;
-    uint64_t buf_read = donut_read_uint64_le(src);
-    uint8_t pb8_flags = buf_read & 0xff;
-    int n = 1;
-	uint64_t val = 0;
-    if (pb8_flags == 0xff) {
-        val = donut_read_uint64_le(src+1);
-        *dst = val;
-        return 1+8;
-    }
-	for (int i = 0; i < 8; ++i) {
-		if (pb8_flags & 0x80) {
-            buf_read >>= 8;
-			pb8_byte = buf_read;
-			++n;
-		}
-		pb8_flags <<= 1;
-		val <<= 8;
-		val |= pb8_byte;
-	}
-    *dst = val;
-	return n;
-}*/
-
 uint64_t donut_flip_plane(uint64_t plane)
 {
 	uint64_t result = 0;
@@ -498,7 +472,7 @@ int donut_decompress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src
 
 int donut_compress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src_length, int* src_bytes_read)
 {
-	uint8_t scratch_space[65+64];
+	uint8_t scratch_space[64+65];
 	int dst_length = 0;
 	int bytes_read = 0;
 	int l;
@@ -510,12 +484,12 @@ int donut_compress(uint8_t* dst, int dst_capacity, const uint8_t* src, int src_l
 		if (dst_bytes_remain <= 0)
 			break;
 		if (dst_bytes_remain < 65) {
-			memset(scratch_space, 0x00, 65+64);
-			memcpy(scratch_space, src, 64);
+			memset(scratch_space, 0x00, 64+65);
+			memcpy(scratch_space, src + bytes_read, 64);
 			l = donut_pack_block(scratch_space+64, scratch_space, 0, NULL);
 			if ((!l) || (l > dst_bytes_remain))
 				break;
-			memcpy(dst, scratch_space+64, l);
+			memcpy(dst + dst_length, scratch_space+64, l);
 			bytes_read += 64;
 			dst_length += l;
 			continue;
