@@ -331,7 +331,9 @@ static bool donut_nes_all_pb8_planes_match(const uint8_t* buf, int len, int pb8_
 int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint8_t* mask)
 {
 	uint64_t planes[(mask) ? 16 : 8];
-	uint8_t cblock[74];
+	uint8_t cblock[76];
+	// 2+9*8 == 74 for max encoded block
+	// 65+11 == 76 for uncompressed block with a optimized block test
 	int i;
 
 	// if no limit specified, then basically unlimited.
@@ -373,6 +375,8 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 		uint8_t plane_def = 0x00;
 		int len = 2;
 		int pb8_count = 0;
+		uint64_t first_non_zero_plane = 0;
+		bool planes_match = true;
 		for (i = 0; i < 8; ++i) {
 			uint64_t plane_predict = 0x0000000000000000;
 			uint64_t plane = planes[i];
@@ -392,6 +396,10 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 				len += donut_pack_pb8(cblock + len, plane, (uint8_t)plane_predict);
 				plane_def |= 1;
 				++pb8_count;
+				if (pb8_count == 1)
+					first_non_zero_plane = plane;
+				else if (plane != first_non_zero_plane)
+					planes_match = false;
 			}
 		}
 		cblock[0] = a | 0x02;
@@ -404,6 +412,7 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 			temp_p[0] = a | 0x06;
 			len = ((len - 2) / pb8_count) + 2;
 			cycles += pb8_count;
+			planes_match = false; // disable that optimization
 		} else {
 			for (i = 0; i < 4*8; i += 8) {
 				if (plane_def == ((0xffaa5500 >> i) & 0xff)) {
@@ -411,13 +420,11 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 					temp_p[0] = a | (i >> 1);
 					--len;
 					cycles -= 5;
+					planes_match = false; // disable that optimization
 					break;
 				}
 			}
 		}
-		// TODO: figure out how to do single plane mode block where
-		// a pb8 plane with a explict leading 0x00/0xff byte makes it
-		// match both predicted planes.
 
 		// compare size and cpu cost to choose the block of this mode
 		// or to keep the old one.
@@ -426,6 +433,22 @@ int donut_pack_block(uint8_t* dst, const uint8_t* src, int cpu_limit, const uint
 			shortest_len = len;
 			least_cost = cycles;
 		}
+
+		// if possible also try this optimization where a single plane mode
+		// block has a pb8 plane with a leading 0x00/0xff byte
+		if ((pb8_count > 1) && planes_match) {
+			temp_p = cblock;
+			temp_p[0] = a | 0x06;
+			temp_p[1] = plane_def;
+			len = 2 + donut_pack_pb8(temp_p+2, first_non_zero_plane, ~(first_non_zero_plane >> (7*8)));
+			cycles = donut_block_runtime_cost(temp_p, len);
+			if ((len <= shortest_len) && ((cycles < least_cost) || (len < shortest_len)) && (cycles <= cpu_limit)) {
+				memcpy(dst, temp_p, len);
+				shortest_len = len;
+				least_cost = cycles;
+			}
+		}
+
 		// onto the next block mode.
 		a += 0x10;
 	}
